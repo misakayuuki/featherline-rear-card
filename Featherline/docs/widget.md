@@ -1,0 +1,643 @@
+# Home-screen widget
+
+How Featherline turns the home-screen cache into two dose app-widget
+surfaces (`HrtWidgetMedium` and `HrtWidgetLarge`) without re-running
+medication math on the widget thread, and how those surfaces stay
+current across home-data mutations, settings changes, alarms, time/date
+events, and quick-log taps. A third surface, the journal-driven
+`HrtAnchorWidget`, follows a separate pipeline described under
+[Anchor widget](#anchor-widget). The whole subsystem lives in
+[`widget/`](../app/src/main/java/com/mkx/hrttracker/widget)
+(33 files). For where it sits in the layer map, see
+[architecture.md](architecture.md).
+
+## Sequence
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant HomeRepo as HomeSnapshotRepository
+  participant Manager as HomeWidgetManager
+  participant WidgetRepo as WidgetSnapshotRepository
+  participant Builder as WidgetSnapshotBuilder
+  participant Store as WidgetSnapshotStore
+  participant Glance as Glance (HrtWidget*)
+  participant Launcher
+
+  App->>Manager: start()
+  Manager-->>HomeRepo: currentCache, current states only
+  HomeRepo-->>Manager: HomeCacheState (Home data + E2 inputs)
+  Manager->>WidgetRepo: writeWidgetSnapshot(state), both parts only
+  WidgetRepo->>Builder: buildWidgetSnapshotRecord(homeData, widgetEstimate(e2Inputs, now), settings, now)
+  Builder-->>WidgetRepo: WidgetSnapshotRecord
+  WidgetRepo->>Store: writeSnapshot(record)
+  WidgetRepo->>Glance: pushHrtWidgets(record) — GlanceRemoteViews.compose
+  Glance-->>WidgetRepo: RemoteViews
+  WidgetRepo-->>Launcher: AppWidgetManager.updateAppWidget
+```
+
+The diagram covers the home-driven refresh path. Three orthogonal
+inputs feed into the same `writeWidgetSnapshot` / `refreshWidgetSnapshot`
+seat: see [Update triggers](#update-triggers) below.
+
+## Pipeline
+
+### Build
+
+[`WidgetSnapshotBuilder.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetSnapshotBuilder.kt)
+exposes one internal function, `buildWidgetSnapshotRecord`. It is pure
+in the same sense the reminder planner is: given a `HomeSnapshotRecord`,
+the widget's estimate, a `SettingsState`, and a `LocalDateTime`, it
+returns a `WidgetSnapshotRecord` with no side effects.
+
+The builder is the only place the widget reads time-of-day cues:
+
+- Before 6 AM, it walks the previous day's schedule with a 6 PM evening
+  cutoff and tags those rows with `WidgetDoseChip.LAST_NIGHT`.
+- After 6 PM, it walks tomorrow's schedule out to 6 AM and tags those
+  rows with `WidgetDoseChip.COMING_UP`.
+- Today's `scheduledEntries` and `unplannedEntries` from
+  `buildPlanDaySchedule(...)` become the main rows.
+
+Each `WidgetDoseRow` carries the identity (`groupUuid`,
+`scheduleTimeUuid`, `medicationUuid`, `entryUuid`), the resolved status
+(`DONE` / `DUE_SOON` / `OVERDUE` / `UPCOMING` / `LOGGED_OUT_OF_WINDOW`),
+display strings, and a `MedicationGroupColorKey` for the accent.
+Mirroring the Plan page, unlogged doses from archived groups (the home
+snapshot's `archivedGroups`) also surface as rows, flagged
+`isFromArchivedGroup = true` to draw an archived-group icon in the
+trailing area.
+`medicationUuid` is the per-group slot id (`MedicationGroupMedication.uuid`)
+— the slot itself now FKs to a catalog `Medicine` via `medicineUuid`,
+which the widget does not carry. The PK projection is the widget's E2
+estimate. `E2EstimateRepository.widgetEstimate` derives it when the
+record is built, from the E2 inputs published in the same cache state
+as the Home data the rows come from, so the rows and the estimate
+describe one run, except after a failed derivation, which keeps the last
+estimate written. It reads logged doses only, over seven days whatever
+Home's chart option, so a planned dose never inflates the reading, and
+it is keyed like Home's estimate (`WidgetEstimateKey`): a rebuild whose
+inputs don't move the key reuses the last derivation. It is stored as a
+`WidgetPkProjectionRecord` so the widget can render it without
+re-simulating; the render path shows a value only while the stored
+window covers the widget's seven-day chart.
+
+Manual (off-schedule) log entries take a separate path
+(`toManualWidgetDoseRow`); they intentionally land with
+`groupUuid = null` and `scheduleTimeUuid = null`, which is the
+invariant that makes [group collapsing](#group-collapsing) safe. A manual
+row marks itself with an edit-square icon in the trailing area in place of
+a textual "manual" label.
+
+Trailing times are pre-formatted into the snapshot rather than stored
+as `LocalDateTime`, because Glance composables can't read the host
+locale or the 12/24-hour preference at compose time.
+`WidgetSnapshotRepository` builds a `DateTimeFormatter` from the app
+language and `context.uses24HourTimeFormat()` and threads it into
+`buildWidgetSnapshotRecord(timeFormatter = …)`. The `TIME_12_24`
+observer in [Update triggers](#update-triggers) drives a refresh when
+the preference flips. See [Localization](localization.md) for the
+widget-specific hard-coded compositions (`/$totalCount <DONE>`,
+`" · "` separators, `"E2 ~"` summary) that need review when adding a
+new language.
+
+### Persist
+
+[`WidgetSnapshotStore.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetSnapshotStore.kt)
+persists the snapshot as an encrypted DataStore file
+(`widget_snapshot.pb`). The serializer wraps a custom
+`WidgetSnapshotCrypto` that uses an AES-256-GCM key minted in the
+Android KeyStore under alias `hrt_widget_snapshot_key`; the container
+format prepends a 4-byte magic (`WDGT`), a one-byte container version,
+the IV length, the IV, and then the ciphertext. A
+`ReplaceFileCorruptionHandler` resets the store to empty on a bad read
+rather than crashing the launcher.
+
+Wire-format compatibility is gated by `WIDGET_SNAPSHOT_SCHEMA_VERSION`
+(currently `16`). `observeSnapshot()` and `readSnapshot()` both filter
+records whose `schemaVersion` doesn't match and log a diagnostic — the
+widget then falls back to its empty-setup composable rather than
+rendering against an obsolete shape.
+
+The store is also the
+[`GlanceStateDefinition`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/HrtWidget.kt#L146)
+for both widgets, so Glance composables read straight from the same
+file via `currentState<WidgetSnapshotState>()`. There is no in-memory
+cache to keep coherent.
+
+### Appearance
+
+User theming lives outside the snapshot, in its own Preferences
+DataStore (`widget_appearance`):
+[`WidgetAppearance`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetAppearance.kt)
+carries `seedHue` (accent; null = dynamic palette), `saturation`,
+`balance` (light/dark depth), plus `contentScale` / `backgroundAlpha` /
+`darkMode` — all moved out of `SettingsRepository` (a one-time
+migration in `HomeWidgetManager.start()` seeds the default from the
+legacy keys, then deletes them). The store keeps an
+`appearance_default` entry plus dormant per-`appWidgetId` overrides, so
+a future per-widget editor needs no storage migration; the v1 UI writes
+only the default.
+[`WidgetAppearanceRepository`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetAppearanceRepository.kt)
+resolves `override ?: default ?: built-in` as a Flow, both render paths
+resolve it per `appWidgetId`, and receiver `onDeleted` drops the
+removed ids' overrides. Values are encoded by the versioned
+`WidgetAppearanceCodec` string, which doubles as the backup payload —
+only the default entry is backed up
+(see [backup-format.md](backup-format.md)).
+
+### Render
+
+[`HrtWidget.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/HrtWidget.kt)
+hosts two `GlanceAppWidget` subclasses:
+
+- `HrtWidgetMedium` — `SizeMode.Exact`, targeting a 2×2 launcher cell.
+  Renders a progress row over today's count and a next-dose /
+  done-badge panel below.
+- `HrtWidgetLarge` — `SizeMode.Exact`, targeting a 4×2 launcher cell by
+  default and resizable down to 3×2, with a scrollable `LazyColumn` of
+  dose rows grouped under `Last night` / `Today` / `Tonight` headers.
+
+Each widget also declares a `previewSizeMode = SizeMode.Responsive(...)`
+that drives the launcher picker preview (via `providePreview`); the
+buckets there (306 × 276 / 624 × 276 dp) are independent of the live
+render size, which follows the launcher cell allocation declared in the
+`appwidget-provider` XML.
+
+Both widgets share a `provideHrtContent` shell that loads the snapshot
+and the per-widget `WidgetAppearance`, resolves the color scheme (an
+explicit accent hue when set, else the system Material You palette on
+API 31+ when adaptive colors are enabled, else the baked
+`DefaultSeedColor` expanded by MaterialKolor), and stacks
+`CompositionLocalProvider`s for the color scheme, content scale,
+background alpha, and forced-dark override. The widget surfaces (shell,
+cards, control pill, outline) are cut from the scheme's secondary
+palette in HCT by `deriveWidgetSurfaces` in `WidgetTheme.kt`, with
+saturation driving chroma and light balance driving tone depth plus a
+contrast-preserving text lift; at the default appearance the shell, cards,
+control pill, and text reproduce the scheme-derived tints exactly (a bit-exact
+anchor enforced by `WidgetThemeDerivationTest`), while the outline and the done
+indicator are tinted and offset from the surface to keep contrast across the range. Shared Glance components
+live in
+[`WidgetRows.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetRows.kt):
+`WidgetShell`, `ProgressRing`, `ProgressBar`, `DoseRow`,
+`TrailingButton`, and `widgetRowHighlightIntent`.
+
+The `appwidget-provider` XML
+([`hrt_widget_medium_info.xml`](https://github.com/mkx173/Featherline/blob/main/app/src/main/res/xml/hrt_widget_medium_info.xml),
+[`hrt_widget_large_info.xml`](https://github.com/mkx173/Featherline/blob/main/app/src/main/res/xml/hrt_widget_large_info.xml))
+declares `resizeMode="horizontal|vertical"`. The large provider keeps its
+4×2 placement defaults in `minWidth` / `minHeight` and `targetCellWidth` /
+`targetCellHeight`, while `minResizeWidth` / `minResizeHeight` set the
+3×2 floor; the medium provider's floor is its 2×2 default. Those floors
+are dp values the launcher divides by the device's real cell size, so
+they need measuring rather than deriving. Both providers ship a `-v31`
+variant that fully overrides the base file, so every size attribute must
+be edited in both — `WidgetProviderInfoResourceTest` pins each pair.
+
+At the 3×2 minimum the large header keeps its `Today · x/y done` label
+readable by measuring rather than by a width threshold:
+`largeHeaderFitsRoomyGap` measures the label and the fixed-width E2 slot,
+and tightens the gap between them only when the label would otherwise
+clip. How much room the header needs depends on the counts and the
+locale, so a width breakpoint cannot express it. All other visual scaling
+follows the user-controlled content-scale contract below.
+
+#### Content scale and launcher resizing
+
+`SizeMode.Exact` means the live widget renders at whatever dp size the
+launcher hands out for the 2×2 / 4×2 default cell (or the 3×2 resized
+minimum), which varies by device and launcher. Launcher allocation controls
+only the available viewport: it never multiplies the visual scale. The
+sanitized `WidgetAppearance.contentScale` value (50–150%) is provided directly
+through `LocalWidgetScale`, and `MediumWidgetContent`, `LargeWidgetContent`,
+and `AnchorWidgetContent` use that value unchanged. `WidgetShell` republishes
+the same value to its descendants.
+
+This makes the setting portable and literal: 100% / 150% mean the same thing
+across launchers, devices, widget types, resizes, and backup restores. Resizing
+can expose more or less content, and an unusually small launcher allocation may
+clip content at larger user-selected scales; it does not silently shrink text,
+icons, rows, or controls to fit. Launcher-picker previews remain independent and
+use the fixed `WIDGET_PREVIEW_CONTENT_SCALE` miniature scale described below.
+
+Before 1.4.0 the medium and large widgets rendered at `(captured portrait cell
+height / 276dp) × contentScale`, with the cell height stored per widget type in the
+`hrt_widget_baseline` SharedPreferences. So upgraded widgets keep their size,
+`WidgetAppearanceRepository.migrateFromLegacySettingsIfNeeded` multiplies that old
+factor into the default appearance's `contentScale` (the height of the dose widget type
+placed now, the smaller one if medium and large differ, or any captured height when
+neither is placed, since v1.3.x never cleared a removed type's height),
+writing a `legacy_baseline_folded` marker in the same store edit, then clears the
+file. The marker keeps a failed clear from folding twice. No release captured an
+anchor height: the anchor widget shipped after the factor was removed.
+
+## Launcher preview
+
+The widget picker has its own rendering path — independent of the
+live snapshot — fed by two delivery channels:
+
+- **Static XML (Android 12+ fallback).** Each `appwidget-provider`
+  declares `android:previewLayout="@layout/hrt_widget_medium_preview"`
+  / `hrt_widget_large_preview`. These are hand-built `RemoteViews`
+  layouts (under `res/layout/`) that mirror the Compose output with
+  hardcoded sample data and translatable strings; they are what the
+  picker shows when no generated preview is available.
+- **Generated dynamic preview (Android 15+).** `HrtWidgetMedium` /
+  `HrtWidgetLarge` override `providePreview(context, widgetCategory)`,
+  which routes through `provideHrtPreviewContent`. That host runs the
+  same Compose content as the live widget but supplies a fabricated
+  `previewSnapshot(context)` plus two preview-only locals:
+  `LocalWidgetScale = WIDGET_PREVIEW_CONTENT_SCALE`,
+  `LocalPreviewE2Text` (a pre-formatted trend pill that bypasses
+  `PkProjection`, whose windowing dislikes fabricated data).
+
+  `HomeWidgetManager.publishGeneratedWidgetPreviews()` publishes the
+  dynamic preview once at startup via
+  `GlanceAppWidgetManager.setWidgetPreviews(receiver,
+  [WIDGET_CATEGORY_HOME_SCREEN])`. The success result is recorded in
+  `hrt_widget_generated_previews` SharedPreferences under
+  `home_screen_preview_version_<class>` with the current
+  `GENERATED_PREVIEW_VERSION`, so it does not re-publish on every
+  launch (and so we respect Android's `setWidgetPreviews` rate limit).
+  **Bump `GENERATED_PREVIEW_VERSION` whenever the preview content
+  changes** — otherwise the previously cached preview keeps showing
+  in the picker.
+
+The Compose preview path also drives `@GlancePreview`-annotated
+composables in `HrtWidget.kt` (`MediumWidgetPreview`,
+`LargeWidgetPreview`) so the preview matches what the picker renders
+at design time.
+
+## Reconfigure
+
+On API 31+ each provider adds `android:configure` plus
+`android:widgetFeatures="reconfigurable|configuration_optional"` in their
+`xml-v31/` provider info, so the launcher's long-press menu offers a
+reconfigure affordance (the base `xml/` variant omits this, so older
+launchers have no entry). It launches
+[`WidgetConfigActivity`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetConfigActivity.kt),
+a full-screen activity hosting
+[`WidgetConfigScreen`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetConfigScreen.kt).
+The activity branches on a `WidgetConfigType` (`MEDIUM` / `LARGE` /
+`ANCHOR`); the dose variants show the appearance controls below, while
+the anchor variant swaps in anchor-selection and background-flag
+controls (see [Anchor widget](#anchor-widget)). For the dose widgets it hosts
+the appearance controls (dark-mode, content scale, background opacity,
+accent color, saturation, light balance) as `HrtSection` rows below a
+live widget preview floating over the system wallpaper. While dark mode
+is "follow system", a corner button on the preview flips it between the
+light and dark look without touching the saved value. The activity uses `Theme.HrtTracker.WidgetConfig`
+(`windowShowWallpaper` with a transparent `windowBackground`); the screen
+paints an opaque offscreen-composited scaffold and punches a `BlendMode.Clear`
+hole in it for the wallpaper window. The system bars therefore sit over the
+opaque scaffold as in `MainActivity`, fixing the black nav bar the old
+translucent-dialog window showed on API < 35. It deliberately does **not**
+reuse the in-app `WidgetAppearanceDialog`.
+
+The preview is a host-free render of the real widget:
+`composeWidgetPreviewRemoteViews` in `HrtWidget.kt` runs the same
+`GlanceRemoteViews().compose` / `MediumWidgetContent` / `LargeWidgetContent`
+path as the live push (sharing `resolveWidgetRenderSize`, so the two cannot
+diverge), composed at the widget's **actual** launcher cell size with the same
+user-selected content scale for true WYSIWYG — falling back to the fixed
+reference preview size when no live options are available (fresh placement).
+A conflated `snapshotFlow` over the control values keeps the preview on the latest
+values without queueing renders, and the resulting `RemoteViews` is applied with the
+**application** context (the AppCompat activity's inflater would otherwise
+inflate `AppCompatImageView`, whose setters lack `@RemotableViewMethod`). The
+preview host intercepts touches, blocks descendant focus, and hides a11y
+descendants so the widget's quick-log / navigation `PendingIntent`s can never
+fire from it.
+
+Widget appearance is **global** in the v1 UI (the store is keyed
+per-widget for a future editor), so the `appWidgetId` is
+only echoed back in the result: the activity defaults to `RESULT_CANCELED`
+and flips to `RESULT_OK` on Save, so cancelling a first-placement config on
+a launcher that ignores `configuration_optional` removes the widget rather
+than keeping it unconfigured. The activity awaits the one-time legacy-keys
+migration before seeding, so the appearance read can't race the startup
+migration and strand Defaults that a Save would clobber. It seeds the controls
+from `widgetAppearanceRepository.currentEffective(null)` (and reads the
+**persisted** settings via `settingsRepository.getCurrentSettings()` for
+its own theme — not the eager `settingsState` placeholder, whose
+pre-DataStore defaults would let a cold-start Save overwrite real
+settings); Save replaces the default entry via `setDefault`, written
+through `@AppScope` so the persist outlives the synchronous
+Save→`finish()`.
+
+## Update triggers
+
+The widget snapshot is rewritten from six independent sources, all
+funnelled through `WidgetSnapshotRepository`:
+
+```mermaid
+graph TD
+  homesnapshot[HomeSnapshotRepository<br/>.currentCache] --> manager
+  settings[SettingsRepository<br/>.settingsState] --> manager
+  timeformat[Settings.System.TIME_12_24<br/>ContentObserver] --> manager
+  midnight[WidgetMidnightRefreshScheduler<br/>explicit midnight alarm] --> datereceiver
+  worker[WidgetDailyRefreshWorker<br/>15-min periodic + on start] --> repo
+  worker -.stale, no current state.-> homesnapshot
+  datereceiver[WidgetDateReceiver<br/>BOOT + DATE/TIME/TZ] --> homesnapshot
+  quicklog[QuickLogActionCallback<br/>widget tap] --> mutation
+  mutation[MedicationLogRepository<br/>.saveNewEntries] --> homesnapshot
+  manager[HomeWidgetManager] --> repo[WidgetSnapshotRepository]
+  repo --> store[widget_snapshot.pb]
+  repo --> push[pushHrtWidgets<br/>GlanceRemoteViews.compose + updateAppWidget]
+```
+
+- **Home-data changes.**
+  [`HomeWidgetManager`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/HomeWidgetManager.kt)
+  is a Hilt `@Singleton` started from `HrtTrackerApplication`. It
+  subscribes to `homeSnapshotRepository.currentCache` and calls
+  `widgetSnapshotRepository.writeWidgetSnapshot(state)` for every
+  current state the rebuild worker publishes. It writes only a state
+  with both parts: the rows from its Home data, the estimate that
+  `E2EstimateRepository.widgetEstimate` derives from the E2 inputs
+  published with them. From a mutation until its run publishes there is
+  no current state, and while a part is missing nothing is written: the
+  widget keeps its last snapshot, estimate included, and is never
+  cleared for that. When the estimate's derivation fails, the rows are
+  still written, with the last snapshot's estimate. `WidgetEstimateKey`
+  moves at midnight, so a failure that doesn't repeat is replaced the
+  next day; until then the widget draws the old estimate while its
+  seven-day chart stays inside that estimate's window, at most about
+  ten days after it was derived.
+- **Widget-facing settings changes.** The same manager observes
+  `settingsRepository.settingsState`, projects it to the tuple
+  (`hideMedicationDetails`, `adaptiveColorEnabled`,
+  `homeE2DisplayUnit`, `appLanguageOption`,
+  `showArchivedGroupRecords`),
+  `distinctUntilChanged().drop(1)`, and calls
+  `refreshWidgetSnapshot()`. This re-derives the widget snapshot from
+  the current state without a home rebuild — Home data itself is
+  unchanged when only widget-only inputs change. Unless the current
+  state has both parts, it asks the worker for a run and leaves the
+  widget as it is.
+- **Appearance changes.** The manager also collects the appearance
+  store's change flow (`drop(1)` to skip the initial emission) into the
+  same `refreshWidgetSnapshot()` seat. On startup, before collecting,
+  it runs the one-time legacy-keys migration and repaints explicitly
+  when anything was migrated (the migration write would otherwise be
+  the dropped initial emission).
+- **Wall-clock drift.**
+  [`WidgetDailyRefreshWorker`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetDailyRefreshWorker.kt)
+  is a periodic `CoroutineWorker` enqueued every 15 minutes (plus one
+  one-shot at app start). It reads the persisted snapshot and checks
+  whether there is none, whether its `anchorDateEpochDay` is before
+  today's date, or whether any row's `UPCOMING`/`DUE_SOON` status should
+  have transitioned by `now`. If so, it rebuilds the widget snapshot
+  from the current cache state and `now` through `writeWidgetSnapshot`
+  (the rows from its Home data, the estimate from its E2 inputs), with
+  no Room read and no solve. Without a current state that has both
+  parts it waits for `homeSnapshotRepository.rebuildNow()` instead, so
+  the job, and the process with it, outlive the run: the run's publish
+  routes back into the cache observer above, and a run that failed
+  earlier is retried. It does the same when a newer publish superseded
+  the state it read, which the observer writes; the run is then only
+  redundant. With fresh rows it just calls
+  `updateAllHrtWidgets` to re-render against the existing snapshot.
+  Either way it ends with `E2EstimateRepository.warmHome()`, which
+  stores Home's estimate when a planned slot passed without a reminder
+  (reminders off, or Doze delayed the alarm); with an unchanged key that
+  costs only the key. The decision lives in `handleWidgetDailyRefresh`,
+  a plain function the tests call without WorkManager.
+- **Date / time / timezone events.**
+  [`WidgetDateReceiver`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetDateReceiver.kt)
+  is a manifest-declared `BroadcastReceiver` for the widget-owned
+  midnight alarm, `BOOT_COMPLETED`, plus best-effort
+  `ACTION_DATE_CHANGED`, `ACTION_TIME_CHANGED`, and
+  `ACTION_TIMEZONE_CHANGED`. Android 8+ does not exempt
+  `ACTION_DATE_CHANGED` manifest receivers from background broadcast
+  limits, so `HomeWidgetManager` also arms
+  [`WidgetMidnightRefreshScheduler`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetMidnightRefreshScheduler.kt)
+  for the next local midnight. A reboot clears that exact alarm, so the
+  receiver re-arms it on every delivery — including `BOOT_COMPLETED` —
+  and, under `goAsync()`, waits for `rebuildNow()` within its budget,
+  again leaning on the cache observer to fan out; out of budget, the
+  run carries on in the app scope.
+- **12-/24-hour preference toggles.** Android does not broadcast when
+  the user flips `Settings.System.TIME_12_24`, but the widget snapshot
+  carries pre-formatted trailing-time strings whose 12-/24-hour shape
+  is baked at build time. `HomeWidgetManager` registers a
+  `ContentObserver` on the setting URI via `observeUses24HourTimeFormat()`
+  and calls `refreshWidgetSnapshot()` on every change (after dropping
+  the initial replay) so the snapshot is rebuilt with the new
+  formatter without forcing a home rebuild.
+
+Two render paths exist in
+[`HrtWidget.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/HrtWidget.kt):
+
+- **`pushHrtWidgets(context, record)`** — composes a one-shot
+  `RemoteViews` per widget via `GlanceRemoteViews().compose(...)` and pushes
+  it with `AppWidgetManager.updateAppWidget`. Used by `writeWidgetSnapshot`
+  after every persist (and by `updateAllHrtWidgets`, whose `null` read
+  renders the empty state). It bypasses Glance's session, whose frame-clock-driven
+  recomposition stalls while the app is backgrounded (so an off-screen
+  settings change applies immediately) and, on a foregrounded tap, briefly
+  paints the `initialLayout` loading spinner during session spin-up. After
+  pushing, it then runs `glanceUpdateAll` for each pushed widget so the
+  session — which the push otherwise leaves at its pre-push composition —
+  recomposes from the just-written DataStore instead of re-asserting stale
+  content when the launcher re-attaches the widget (page swipe, reconfigure
+  dismiss). Tradeoff: a single composed size instead of Glance's
+  portrait/landscape variants; content scale remains the same user-selected
+  value in either orientation.
+
+  The synchronous push is gated **per widget** by
+  `shouldUseSynchronousWidgetPush`:
+  - The **medium** widget is built only from plain views, so
+    `updateAppWidget` refreshes it on every API level — it always takes the
+    synchronous push, avoiding the loading-spinner flash.
+  - The **large** widget contains a `LazyColumn` (a collection-backed view).
+    A bare `updateAppWidget` does not rebind that collection below API 33
+    (only the session update / `notifyAppWidgetViewDataChanged` does, and
+    Glance does not expose the collection's view id), so below 33 it falls
+    back to the session path and renders the snapshot just written to the
+    DataStore — and still flashes the loading spinner there. API 33+ rebinds
+    inline `RemoteCollectionItems` from `updateAppWidget`, so the synchronous
+    push is used.
+
+  On the synchronous path this imposes a **structural-stability requirement**
+  on the composables (see [Notable invariants](#notable-invariants)): because
+  `updateAppWidget` reuses the launcher's existing `LazyColumn` collection
+  adapter, the composed `RemoteViews` tree must keep the same shape across
+  updates, or the adapter recycles a stale/blank item view.
+- **`updateAllHrtWidgets(context)`** — `glanceUpdateAll` for both sizes;
+  the worker and quick-log paths call it when the snapshot hasn't
+  changed (nothing new to push). The large widget below API 33 also reuses
+  `glanceUpdateAll` (for that one size) as its `pushHrtWidgets` fallback.
+
+## Quick-log action
+
+[`QuickLogActionCallback`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/QuickLogActionCallback.kt)
+is the `ActionCallback` wired to the medium widget's action button and
+the large widget's per-row log buttons. Its parameter contract is five
+keys: `GroupUuidKey`, `ScheduleTimeUuidKey` (nullable), `ScheduledAtKey`
+(serialized `LocalDateTime`), `MedicationUuidKey` (empty/null for
+whole-group logging and set to the slot's
+`MedicationGroupMedication.uuid` for single-slot logging, not the
+catalog `Medicine.uuid`), and `ArchivedGroupRowKey` (whether the tapped
+row was rendered as an archived-group row).
+
+The callback resolves the group via the
+[`WidgetEntryPoint`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetEntryPoint.kt)
+Hilt accessor (the standard pattern for getting Hilt-bound singletons
+from non-`@AndroidEntryPoint` receivers and callbacks), narrows the
+medication list when `MedicationUuidKey` is set (matching against
+`group.medications.firstOrNull { it.uuid == medicationUuid }`), reuses
+the reminder subsystem's `buildMissingScheduledLogEntries` to materialise
+the needed logs, and writes them via
+`MedicationLogRepository.saveNewEntries`.
+Persisting goes through `HomeSnapshotRepository.runHomeDataMutation`,
+which means the home-snapshot observer in `HomeWidgetManager`
+re-derives the widget snapshot — the callback itself does not need to
+touch the widget store. It then waits for `rebuildNow()` within what is
+left of its 8 s budget, so the run that read the log, and its warm-up
+of Home's estimate, finish before the callback does; out of budget, the
+run carries on in the app scope. The only direct `updateAllHrtWidgets`
+call in this path is the no-op short-circuit, taken when the slot is
+already fulfilled.
+
+Because the persist runs through `saveNewEntries`, quick-logged doses
+deduct medicine stock for tracking-enabled medicines just like an
+in-app log, and the callback then shows the same worst-severity
+low-stock toast as the notification "Log all" action (see
+[reminders.md](reminders.md#notify)). The widget snapshot itself carries
+no stock data; low-stock state surfaces in the app (home section +
+toasts), not on the widget.
+
+### Archived-group doses
+
+Unlogged doses from archived groups surface as rows (flagged
+`isFromArchivedGroup`, see above) and can be quick-logged. That
+render-time flag is carried into the action as `ArchivedGroupRowKey`, and
+the callback only re-logs into an archived group when the tapped row was
+actually *rendered* as archived. A still-active row whose group was
+archived after it was composed is treated as stale: the callback refreshes
+the widget and bails instead of logging into the now-archived group.
+
+### Group collapsing
+
+When several scheduled rows share the same group and scheduled time,
+the medium widget collapses them to one row and the large widget does
+the same when `hideMedicationDetails` is on. Both groupings are keyed
+on **`(groupUuid, scheduledAt)`** — `groupName` is user-visible and not
+unique, so two distinct groups that happen to share a name and a slot
+would otherwise alias into a single row and the quick-log action could
+target the wrong group. Manual records (which carry
+`groupUuid = null`) are filtered out before grouping, so the
+non-nullable key is safe.
+
+`collapseToGroupRow` in
+[`HrtWidget.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/HrtWidget.kt#L120)
+is the seat that produces the representative row: it picks the
+strongest status (`DONE` > `OVERDUE` > `DUE_SOON` > `UPCOMING` >
+`LOGGED_OUT_OF_WINDOW`), forwards `groupUuid` / `scheduleTimeUuid`, and
+zeroes `medicationUuid` so the resulting action targets the entire
+group.
+
+## Highlight deep link
+
+`widgetRowHighlightIntent` in
+[`WidgetRows.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetRows.kt#L365)
+builds the `MainActivity` intent used when the user taps a widget row
+(as distinct from the log button). It uses a `hrttracker://` data URI
+plus `EXTRA_HIGHLIGHT_*` extras so the home screen can scroll to and
+flash the matching row. The URI's stable key joins
+`groupUuid:scheduleTimeUuid:scheduledAt:medicationUuid` for scheduled
+rows and `manual/<entryUuid>` for manual rows; uniqueness matters
+because Android coalesces `PendingIntent`s with equal `data`.
+
+## Background widget surface
+
+`WidgetShell` in
+[`WidgetRows.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/WidgetRows.kt#L63)
+applies the user-configurable background alpha and the rounded
+container, and wraps the entire widget in `clickable(actionStartActivity<MainActivity>())`
+so the top-level tap target is the app, with row-level and
+button-level clickables consuming taps that should not propagate.
+
+The shell, row cards, and action controls use pre-rendered rounded bitmap
+masks on every supported Android version instead of relying on a launcher
+outline radius. This keeps their corner geometry intact while the launcher
+temporarily reparents and scales the widget during long-press move/resize.
+
+The widget never resolves colors at composition time for surfaces that
+might cross the day/night boundary — bitmap icons are tinted with
+`ColorFilter` so the launcher applies the active palette when it
+renders the `RemoteViews`.
+
+## Anchor widget
+
+`HrtAnchorWidget` in
+[`AnchorWidget.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/AnchorWidget.kt)
+is a third `GlanceAppWidget`, targeting a 2×1 launcher cell, that shows
+one journal date (an "anchor") and its running day count. Unlike the
+dose widgets it does **not** read the home snapshot: its per-instance
+Glance state is just an `anchorId`
+([`AnchorWidgetState.kt`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/AnchorWidgetState.kt)),
+and the name, date, and day count are read live from the journal at
+compose time; the chrome and content scale (background, opacity, palette,
+dark mode, and scale) come from the shared `WidgetAppearance`.
+
+Because it is journal-driven, the anchor surfaces sit outside the
+six-source `WidgetSnapshotRepository` funnel and have their own manager.
+[`AnchorWidgetManager`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/AnchorWidgetManager.kt)
+(`@Singleton`, `start()` called once from `HrtTrackerApplication.onCreate()`
+alongside `homeWidgetManager.start()`) observes the journal's anchor ids
+and dates and, on any add / edit / delete, re-renders every anchor
+widget and refreshes the pinned shortcuts. It is deliberately isolated
+from `HomeWidgetManager`.
+
+[`AnchorShortcutManager`](https://github.com/mkx173/Featherline/blob/main/app/src/main/java/com/mkx/hrttracker/widget/AnchorShortcutManager.kt)
+backs the pinned-shortcut surface: a launcher shortcut per anchor,
+keyed `SHORTCUT_ID_PREFIX + anchor.id` (`"anchor:"`), with an
+adaptive icon bitmap baking the day count. Tapping one deep-links into
+that anchor's milestones (seeded from a persisted cold-start snapshot;
+the milestones screen itself lives in `ui/journal/`). The manager
+pins, refreshes live shortcuts, and disables shortcuts whose anchor was
+deleted.
+
+## Notable invariants
+
+- `WidgetDoseRow` rows with `isManualRecord = true` have null
+  `groupUuid` and null `scheduleTimeUuid`. Anything that groups by
+  group identity must filter these out first.
+- The widget is never cleared because the cache is behind, or because a
+  part is missing or invalid. `writeWidgetSnapshot` is the only writer.
+  It takes one write at a time, and writes a state only while it is still
+  the latest current one, and only when it has both parts; otherwise the
+  last snapshot, estimate included, stays in place. So a slow write of an
+  older state, such as the worker's, can't land after a newer state's.
+- `WIDGET_SNAPSHOT_SCHEMA_VERSION` bumps invalidate the persisted
+  snapshot on read; bump it whenever you change the shape of
+  `WidgetSnapshotRecord` or any nested record, then verify the empty
+  widget renders before the next home refresh.
+- The widget snapshot is not part of the backup format
+  (see [backup-format.md](backup-format.md)) and is excluded from
+  device-transfer flows; it is treated as derived state and rebuilt
+  from the home snapshot on first launch. The widget *appearance*
+  default, by contrast, is backed up — only the default entry, since
+  appWidgetIds are not stable across devices.
+- `HomeWidgetManager.start()` is idempotent and called exactly once
+  from `HrtTrackerApplication.onCreate()`; the `started.compareAndSet`
+  guard exists to make double-`start()` a no-op for tests rather than
+  to defend against repeated app starts.
+- The 15-minute worker interval is the WorkManager floor for periodic
+  work — do not lower it expecting tighter cadence.
+- Release minification must keep each `GlanceAppWidget` subclass distinct.
+  `app/proguard-rules.pro` pins them because Glance resolves instances by
+  `javaClass`; if R8 merges `HrtWidgetMedium` and `HrtWidgetLarge`, release
+  builds can send the medium layout to the large widget.
+- **Keep the `RemoteViews` tree structurally stable across updates.** The
+  synchronous `pushHrtWidgets` path pushes a freshly composed `RemoteViews`
+  into the launcher's *existing* `LazyColumn` collection adapter via
+  `updateAppWidget`; the adapter recycles item views by layout id, so if a
+  row's tree shape changes between updates it binds into a stale slot and
+  renders blank. `DoseRow` and `MediumWidgetContent` therefore emit their
+  optional elements (supporting route/dose line, trailing-time/label) as
+  always-present `Text` nodes, blanked under `hideMedicationDetails` rather
+  than omitted. Do not "tidy" these into `if (…) { Text(…) }` — that
+  reintroduces the toggle-driven blank-row bug.

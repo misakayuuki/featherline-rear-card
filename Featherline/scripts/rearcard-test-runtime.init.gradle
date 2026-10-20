@@ -1,0 +1,18 @@
+// Export the existing Android unit-test runtime without changing dependency versions.
+gradle.projectsEvaluated {
+    def app = gradle.rootProject.project(':app')
+    app.tasks.register('exportRearCardTestRuntime') {
+        dependsOn('transformArm64DebugUnitTestClassesWithAsm')
+        doLast {
+            def testTask = app.tasks.named('testArm64DebugUnitTest').get()
+            def output = gradle.rootProject.layout.buildDirectory
+                .file('rearcard-test-runtime.json').get().asFile
+            output.parentFile.mkdirs()
+            output.setText(groovy.json.JsonOutput.toJson([
+                javaExecutable: testTask.javaLauncher.get().executablePath.asFile.absolutePath,
+                classpath: testTask.classpath.files.collect { it.absolutePath }
+            ]), 'UTF-8')
+            println('Rear-card test runtime exported to ' + output)
+        }
+    }
+}

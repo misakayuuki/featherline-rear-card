@@ -1,0 +1,60 @@
+# Gradle files
+.gradle/
+build/
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Log/OS Files
+*.log
+
+# Android Studio generated files and folders
+captures/
+.externalNativeBuild/
+.cxx/
+*.aab
+*.apk
+output-metadata.json
+
+# IntelliJ
+*.iml
+.idea/
+misc.xml
+deploymentTargetDropDown.xml
+render.experimental.xml
+
+# Keystore files
+*.jks
+*.keystore
+
+# Google Services (e.g. APIs or Firebase)
+google-services.json
+
+# Android Profiling
+*.hprof
+
+# Agents
+.claude/
+AGENTS.md
+CLAUDE.md
+CONTEXT.md
+
+# Personal notes (in-progress design docs, screenshots seed, etc.)
+notes/
+
+# Backups (local app-exported backup files)
+featherline-backup*
+keystore.properties
+
+# macOS
+.DS_Store
+
+# Superpowers
+.superpowers/
+docs/superpowers/
+
+# Codegraph
+.codegraph/
+
+# Kotlin
+.kotlin/

@@ -1,0 +1,14 @@
+import {readFile,writeFile,mkdir,copyFile} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+import {compileScript} from '../upstream/rear-card-bridge/tools/card-build/src/compile.js';
+import {buildModuleZip} from '../upstream/rear-card-bridge/tools/card-build/src/build.js';
+const root=path.dirname(fileURLToPath(import.meta.url));
+const assets=path.join(root,'Featherline/app/src/main/assets/rearcard');
+await mkdir(assets,{recursive:true});
+for(const name of ['core.js','main.js']) await writeFile(path.join(assets,name),await compileScript(await readFile(path.join(root,'module/card',name),'utf8'),'card/'+name));
+await copyFile(path.join(root,'module/card/index.html'),path.join(assets,'index.html'));
+await copyFile(path.join(root,'module/module.json'),path.join(assets,'module.json'));
+await mkdir(path.join(root,'dist'),{recursive:true});
+await buildModuleZip({sourceDir:path.join(root,'module'),outPath:path.join(root,'dist/featherline-rear-card-0.1.0.zip')});
+console.log('Prepared app assets and starter module ZIP (no health data).');
