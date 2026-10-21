@@ -1,0 +1,520 @@
+package com.mkx.hrttracker.ui.navigation
+
+import androidx.compose.runtime.saveable.SaverScope
+import androidx.lifecycle.Lifecycle
+import com.mkx.hrttracker.model.medication.DoseInstruction
+import com.mkx.hrttracker.model.medication.MedicationApplicationType
+import com.mkx.hrttracker.model.medication.MedicationCategory
+import com.mkx.hrttracker.model.medication.MedicationGroupColorKey
+import com.mkx.hrttracker.model.medication.MedicationKey
+import com.mkx.hrttracker.model.medication.MedicationLogEntry
+import com.mkx.hrttracker.model.medication.MedicinePreparation
+import com.mkx.hrttracker.model.medication.testCustomMedicine
+import com.mkx.hrttracker.model.medication.testMedicine
+import com.mkx.hrttracker.ui.log.MedicationLogEntryEditSnapshot
+import com.mkx.hrttracker.ui.log.MedicationLogEntryQuickLogRequest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.time.Instant
+import java.time.LocalDateTime
+import java.util.UUID
+
+class HrtTrackerNavHostTest {
+    @Test
+    fun topLevelNavigationTapAction_returnsScrollToTop_for_active_top_level_route() {
+        assertEquals(
+            TopLevelNavigationTapAction.SCROLL_TO_TOP,
+            topLevelNavigationTapAction(
+                tappedScreen = Screen.Main,
+                selectedBottomScreen = Screen.Main,
+                currentRoute = Screen.Main.route,
+            )
+        )
+    }
+
+    @Test
+    fun topLevelNavigationTapAction_returnsPopToTopLevel_for_child_of_selected_route() {
+        assertEquals(
+            TopLevelNavigationTapAction.POP_TO_TOP_LEVEL,
+            topLevelNavigationTapAction(
+                tappedScreen = Screen.Settings,
+                selectedBottomScreen = Screen.Settings,
+                currentRoute = Screen.SettingsCalibration.baseRoute,
+            )
+        )
+    }
+
+    @Test
+    fun topLevelNavigationTapAction_returnsNavigate_for_different_top_level_route() {
+        assertEquals(
+            TopLevelNavigationTapAction.NAVIGATE,
+            topLevelNavigationTapAction(
+                tappedScreen = Screen.Settings,
+                selectedBottomScreen = Screen.Plan,
+                currentRoute = Screen.Plan.route,
+            )
+        )
+    }
+
+    @Test
+    fun topLevelNavigationTapAction_returnsPopToTopLevel_for_plan_history_route() {
+        assertEquals(
+            TopLevelNavigationTapAction.POP_TO_TOP_LEVEL,
+            topLevelNavigationTapAction(
+                tappedScreen = Screen.Plan,
+                selectedBottomScreen = Screen.Plan,
+                currentRoute = Screen.History.route,
+            )
+        )
+    }
+
+    @Test
+    fun topLevelNavigationTapAction_returnsPopToTopLevel_for_planBatchAdd_route() {
+        assertEquals(
+            TopLevelNavigationTapAction.POP_TO_TOP_LEVEL,
+            topLevelNavigationTapAction(
+                tappedScreen = Screen.Plan,
+                selectedBottomScreen = Screen.Plan,
+                currentRoute = Screen.PlanBatchAdd.route,
+            )
+        )
+    }
+
+    @Test
+    fun topLevelNavigationTapAction_returnsPopToTopLevel_for_planArchivedGroups_route() {
+        assertEquals(
+            TopLevelNavigationTapAction.POP_TO_TOP_LEVEL,
+            topLevelNavigationTapAction(
+                tappedScreen = Screen.Plan,
+                selectedBottomScreen = Screen.Plan,
+                currentRoute = Screen.PlanArchivedGroups.route,
+            )
+        )
+    }
+
+    @Test
+    fun medicinesCreateRouteIncludesOptionalSlotResultKey() {
+        assertEquals("medicines/plan", Screen.Medicines.createRoute(Screen.Plan.route))
+        assertEquals(
+            "medicines/plan?slotResultKey=addEntrySlotResult",
+            Screen.Medicines.createRoute(Screen.Plan.route, slotResultKey = "addEntrySlotResult"),
+        )
+    }
+
+    @Test
+    fun medicineDetailCreateRouteIncludesOptionalOpenOptInFlag() {
+        val medicineId = "aaaaaaaa-0000-0000-0000-000000000000"
+        assertEquals(
+            "medicine_detail/$medicineId?topLevelParent=plan",
+            Screen.MedicineDetail.createRoute(medicineId = medicineId),
+        )
+        assertEquals(
+            "medicine_detail/$medicineId?topLevelParent=plan&openOptIn=true",
+            Screen.MedicineDetail.createRoute(
+                medicineId = medicineId,
+                openOptIn = true,
+            ),
+        )
+    }
+
+    @Test
+    fun topLevelNavigationReplacementPopUpToRoute_usesSelectedTopLevelRoute() {
+        assertEquals(
+            Screen.Plan.route,
+            topLevelNavigationReplacementPopUpToRoute(
+                targetScreen = Screen.Main,
+                selectedBottomScreen = Screen.Plan,
+            )
+        )
+    }
+
+    @Test
+    fun topLevelRootBackAction_navigatesHomeFromNonHomeTopLevelRoot() {
+        assertEquals(
+            TopLevelRootBackAction.NAVIGATE_HOME,
+            topLevelRootBackAction(
+                selectedBottomScreen = Screen.Settings,
+                currentRoute = Screen.Settings.route,
+            )
+        )
+    }
+
+    @Test
+    fun topLevelRootBackAction_doesNotHandleBackFromChildRoute() {
+        assertEquals(
+            TopLevelRootBackAction.NONE,
+            topLevelRootBackAction(
+                selectedBottomScreen = Screen.Settings,
+                currentRoute = Screen.SettingsCalibration.baseRoute,
+            )
+        )
+    }
+
+    @Test
+    fun homeDeepLinkNavigationAction_ignoresAlreadyHandledSignal() {
+        assertEquals(
+            HomeDeepLinkNavigationAction.NONE,
+            homeDeepLinkNavigationAction(
+                homeDeepLinkSignal = 2,
+                lastHandledHomeDeepLinkSignal = 2,
+                currentRoute = Screen.Settings.route,
+            )
+        )
+    }
+
+    @Test
+    fun homeDeepLinkNavigationAction_waitsForCurrentRouteBeforeHandlingNewSignal() {
+        assertEquals(
+            HomeDeepLinkNavigationAction.AWAIT_ROUTE,
+            homeDeepLinkNavigationAction(
+                homeDeepLinkSignal = 1,
+                lastHandledHomeDeepLinkSignal = 0,
+                currentRoute = null,
+            )
+        )
+    }
+
+    @Test
+    fun homeDeepLinkNavigationAction_marksHandledWithoutNavigationWhenAlreadyOnHome() {
+        assertEquals(
+            HomeDeepLinkNavigationAction.NONE,
+            homeDeepLinkNavigationAction(
+                homeDeepLinkSignal = 1,
+                lastHandledHomeDeepLinkSignal = 0,
+                currentRoute = Screen.Main.route,
+            )
+        )
+    }
+
+    @Test
+    fun homeDeepLinkNavigationAction_navigatesHomeFromOtherRoutes() {
+        assertEquals(
+            HomeDeepLinkNavigationAction.NAVIGATE_HOME,
+            homeDeepLinkNavigationAction(
+                homeDeepLinkSignal = 1,
+                lastHandledHomeDeepLinkSignal = 0,
+                currentRoute = Screen.SettingsCalibration.route,
+            )
+        )
+    }
+
+    @Test
+    fun homeDeepLinkHighlightEffectsEnabled_waitsForReadySignal() {
+        assertFalse(
+            homeDeepLinkHighlightEffectsEnabled(
+                shellHighlightEffectsEnabled = true,
+                homeDeepLinkSignal = 2,
+                readyHomeDeepLinkHighlightSignal = 1,
+            )
+        )
+    }
+
+    @Test
+    fun homeDeepLinkHighlightEffectsEnabled_enablesAfterReadySignal() {
+        assertTrue(
+            homeDeepLinkHighlightEffectsEnabled(
+                shellHighlightEffectsEnabled = true,
+                homeDeepLinkSignal = 2,
+                readyHomeDeepLinkHighlightSignal = 2,
+            )
+        )
+    }
+
+    @Test
+    fun homeDeepLinkHighlightEffectsEnabled_staysDisabledWhenShellDisabled() {
+        assertFalse(
+            homeDeepLinkHighlightEffectsEnabled(
+                shellHighlightEffectsEnabled = false,
+                homeDeepLinkSignal = 2,
+                readyHomeDeepLinkHighlightSignal = 2,
+            )
+        )
+    }
+
+    @Test
+    fun medicationLogEntrySheetRequestSaver_roundTripsNull() {
+        val saver = MedicationLogEntrySheetRequestSaver
+        val saved = with(saver) { scope.save(null) }
+        assertNotNull(saved)
+        assertNull(saver.restore(saved!!))
+    }
+
+    @Test
+    fun medicationLogEntrySheetRequestSaver_roundTripsEditEntries() {
+        val original = MedicationLogEntrySheetRequest(
+            entryIds = listOf(
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222"
+            ),
+        )
+
+        assertEquals(original, roundTrip(original))
+    }
+
+    @Test
+    fun medicationLogEntrySheetRequestSaver_roundTripsQuickLogRequestForEveryDoseShape() {
+        // Cover every DoseInstruction branch so future additions break the test.
+        val doseCases = listOf(
+            Triple(
+                DoseInstruction.TabletFraction(1, 2),
+                testMedicine(
+                    uuid = UUID.fromString("dddddddd-0000-0000-0000-000000000001"),
+                    key = MedicationKey.ESTRADIOL,
+                ),
+                MedicationApplicationType.ORAL,
+            ),
+            Triple(
+                DoseInstruction.WholeUnit,
+                testCustomMedicine(
+                    uuid = UUID.fromString("dddddddd-0000-0000-0000-000000000010"),
+                    medicationName = "Capsule med",
+                    preparation = MedicinePreparation.Capsule(strengthMgPerCapsule = 100.0),
+                ),
+                MedicationApplicationType.ORAL,
+            ),
+            Triple(
+                DoseInstruction.VolumeMl(0.5),
+                testMedicine(
+                    uuid = UUID.fromString("dddddddd-0000-0000-0000-000000000011"),
+                    key = MedicationKey.ESTRADIOL_VALERATE,
+                    preparation = MedicinePreparation.InjectionMultiUseVial(
+                        concentrationMgPerMl = 10.0,
+                        vialVolumeMl = 5.0,
+                    ),
+                ),
+                MedicationApplicationType.INJECTION,
+            ),
+            Triple(
+                DoseInstruction.WeightGrams(1.25),
+                testMedicine(
+                    uuid = UUID.fromString("dddddddd-0000-0000-0000-000000000012"),
+                    key = MedicationKey.ESTRADIOL_GEL,
+                    preparation = MedicinePreparation.GelContainer(
+                        concentrationPercent = 0.06,
+                        containerWeightGrams = 80.0,
+                    ),
+                ),
+                MedicationApplicationType.GEL,
+            ),
+            Triple(
+                DoseInstruction.Noop,
+                null,
+                MedicationApplicationType.PATCH_OFF,
+            ),
+        )
+        doseCases.forEach { (doseInstruction, medicine, applicationType) ->
+            val request = MedicationLogEntrySheetRequest(
+                quickLogRequest = MedicationLogEntryQuickLogRequest(
+                    groupId = UUID.fromString("33333333-3333-3333-3333-333333333333"),
+                    scheduleTimeUuid = UUID.fromString("44444444-4444-4444-4444-444444444444"),
+                    scheduledFor = LocalDateTime.of(2026, 5, 11, 9, 30),
+                    medicine = medicine,
+                    applicationType = applicationType,
+                    doseInstruction = doseInstruction,
+                    medicationCount = 1,
+                ),
+            )
+            assertEquals("doseInstruction=$doseInstruction", request, roundTrip(request))
+        }
+    }
+
+    @Test
+    fun medicationLogEntrySheetRequestSaver_roundTripsPatchOffQuickLogWithNullMedicine() {
+        // A PATCH_OFF quick-log carries no medicine; the Saver must survive null.
+        val request = MedicationLogEntrySheetRequest(
+            quickLogRequest = MedicationLogEntryQuickLogRequest(
+                groupId = UUID.fromString("33333333-3333-3333-3333-333333333333"),
+                scheduleTimeUuid = UUID.fromString("44444444-4444-4444-4444-444444444444"),
+                scheduledFor = LocalDateTime.of(2026, 5, 11, 9, 30),
+                medicine = null,
+                applicationType = MedicationApplicationType.PATCH_OFF,
+                doseInstruction = DoseInstruction.Noop,
+                medicationCount = 1,
+            ),
+        )
+
+        assertEquals(request, roundTrip(request))
+    }
+
+    @Test
+    fun medicationLogEntrySheetRequestSaver_roundTripsCustomSelectionAndOptionalScheduleTime() {
+        val request = MedicationLogEntrySheetRequest(
+            quickLogRequest = MedicationLogEntryQuickLogRequest(
+                groupId = UUID.fromString("55555555-5555-5555-5555-555555555555"),
+                scheduleTimeUuid = null,
+                scheduledFor = LocalDateTime.of(2026, 5, 11, 21, 0),
+                medicine = testCustomMedicine(
+                    uuid = UUID.fromString("dddddddd-0000-0000-0000-000000000002"),
+                    medicationName = "My med",
+                    preparation = MedicinePreparation.Pill(strengthMgPerTablet = 0.25),
+                ),
+                applicationType = MedicationApplicationType.SUBLINGUAL,
+                doseInstruction = DoseInstruction.TabletFraction(1, 1),
+                medicationCount = 2,
+            ),
+        )
+
+        assertEquals(request, roundTrip(request))
+    }
+
+    @Test
+    fun medicationLogEntrySheetRequestSaver_roundTripsSnapshotGroupContext() {
+        val request = MedicationLogEntrySheetRequest(
+            quickLogRequest = MedicationLogEntryQuickLogRequest(
+                groupId = UUID.fromString("66666666-6666-6666-6666-666666666666"),
+                scheduleTimeUuid = UUID.fromString("77777777-7777-7777-7777-777777777777"),
+                scheduledFor = LocalDateTime.of(2026, 5, 11, 21, 0),
+                medicine = testMedicine(
+                    uuid = UUID.fromString("dddddddd-0000-0000-0000-000000000003"),
+                    key = MedicationKey.ESTRADIOL,
+                ),
+                applicationType = MedicationApplicationType.ORAL,
+                doseInstruction = DoseInstruction.TabletFraction(1, 1),
+                medicationCount = 2,
+                sourceGroupName = "Snapshot estradiol",
+                sourceGroupColorKey = MedicationGroupColorKey.PLUM,
+                sourceGroupPreviousScheduledFor = LocalDateTime.of(2026, 5, 10, 21, 0),
+                sourceGroupNextScheduledFor = LocalDateTime.of(2026, 5, 12, 21, 0),
+            ),
+        )
+
+        assertEquals(request, roundTrip(request))
+    }
+
+    @Test
+    fun medicationLogEntrySheetRequestSaver_roundTripsEditSnapshot() {
+        val groupId = UUID.fromString("88888888-8888-8888-8888-888888888888")
+        val scheduleTimeId = UUID.fromString("99999999-9999-9999-9999-999999999999")
+        val entryId = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        val scheduledFor = LocalDateTime.of(2026, 5, 11, 21, 0)
+        val entry = MedicationLogEntry(
+            uuid = entryId,
+            medicine = testMedicine(
+                uuid = UUID.fromString("dddddddd-0000-0000-0000-000000000004"),
+                key = MedicationKey.ESTRADIOL,
+            ),
+            category = MedicationCategory.ESTRADIOL,
+            applicationType = MedicationApplicationType.ORAL,
+            doseInstruction = DoseInstruction.TabletFraction(1, 1),
+            equivalentE2Mg = 2.0,
+            sourceGroupUuid = groupId,
+            scheduleTimeUuid = scheduleTimeId,
+            appliedAt = Instant.parse("2026-05-11T12:05:00Z"),
+            appliedAtTimeZoneId = "Asia/Tokyo",
+            scheduledFor = scheduledFor,
+            count = 2,
+        )
+        val request = MedicationLogEntrySheetRequest(
+            entryIds = listOf(entryId.toString()),
+            editSnapshot = MedicationLogEntryEditSnapshot(
+                entries = listOf(entry),
+                sourceGroupName = "Snapshot estradiol",
+                sourceGroupColorKey = MedicationGroupColorKey.PLUM,
+                sourceGroupPreviousScheduledFor = scheduledFor.minusDays(1),
+                sourceGroupNextScheduledFor = scheduledFor.plusDays(1),
+            ),
+        )
+
+        assertEquals(request, roundTrip(request))
+    }
+
+    @Test
+    fun chromeUnlocked_whenNoModalSheetOrMutationIsPending() {
+        assertFalse(
+            isTopLevelNavigationChromeLocked(
+                isNavigationLockHeld = false,
+                hasPendingLogEntrySheetRequest = false,
+                hasPendingStockOptInSheet = false,
+            )
+        )
+    }
+
+    @Test
+    fun chromeLocked_whileModalOrMutationLockIsHeld() {
+        assertTrue(
+            isTopLevelNavigationChromeLocked(
+                isNavigationLockHeld = true,
+                hasPendingLogEntrySheetRequest = false,
+                hasPendingStockOptInSheet = false,
+            )
+        )
+    }
+
+    @Test
+    fun chromeLocked_theInstantAHostedSheetRequestIsSet() {
+        // The NavHost-hosted sheet requests are checked directly rather than
+        // through the composition-reported lock: they become non-null
+        // synchronously inside the row tap that opens the sheet, before the
+        // sheet's window exists to block chrome taps itself.
+        assertTrue(
+            isTopLevelNavigationChromeLocked(
+                isNavigationLockHeld = false,
+                hasPendingLogEntrySheetRequest = true,
+                hasPendingStockOptInSheet = false,
+            )
+        )
+        assertTrue(
+            isTopLevelNavigationChromeLocked(
+                isNavigationLockHeld = false,
+                hasPendingLogEntrySheetRequest = false,
+                hasPendingStockOptInSheet = true,
+            )
+        )
+    }
+
+    @Test
+    fun canOpenOverlaySheetFrom_allowsTapsFromResumedCurrentDestination() {
+        assertTrue(
+            canOpenOverlaySheetFrom(
+                originState = Lifecycle.State.RESUMED,
+                isCurrentDestination = true,
+            )
+        )
+    }
+
+    @Test
+    fun canOpenOverlaySheetFrom_allowsTapsWhileTheCurrentEntryIsStillAnimatingIn() {
+        // A freshly pushed (or pop-restored) entry sits at STARTED for its whole
+        // ~300 ms enter transition while its content is already composed and
+        // tappable. It is still the current destination, so a row tap there is
+        // legitimate and must open the sheet rather than being silently dropped.
+        assertTrue(
+            canOpenOverlaySheetFrom(
+                originState = Lifecycle.State.STARTED,
+                isCurrentDestination = true,
+            )
+        )
+    }
+
+    @Test
+    fun canOpenOverlaySheetFrom_dropsTapsFromAnEntryThatIsNoLongerCurrent() {
+        // Compose Navigation demotes the outgoing entry to STARTED the moment a
+        // navigation begins, and the back queue makes the destination current at
+        // once — so a row tap racing that navigation is no longer the current
+        // destination and must not open the sheet over the destination page.
+        assertFalse(
+            canOpenOverlaySheetFrom(
+                originState = Lifecycle.State.STARTED,
+                isCurrentDestination = false,
+            )
+        )
+        assertFalse(
+            canOpenOverlaySheetFrom(
+                originState = Lifecycle.State.CREATED,
+                isCurrentDestination = true,
+            )
+        )
+    }
+
+    private val scope = SaverScope { true }
+
+    private fun roundTrip(request: MedicationLogEntrySheetRequest?): MedicationLogEntrySheetRequest? {
+        val saver = MedicationLogEntrySheetRequestSaver
+        val saved = with(saver) { scope.save(request) } ?: error("saver returned null")
+        return saver.restore(saved)
+    }
+}

@@ -1,0 +1,299 @@
+package com.mkx.hrttracker.ui.components
+
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.minus
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.ButtonGroupDefaults
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ToggleButton
+import androidx.compose.material3.ToggleButtonColors
+import androidx.compose.material3.ToggleButtonDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+enum class ConnectedButtonGroupLayout {
+    FLOW_ROW,
+    ROW,
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun <T> ConnectedButtonGroup(
+    modifier: Modifier = Modifier,
+    options: List<T>,
+    selectedOption: T?,
+    optionLabel: @Composable (T) -> String,
+    optionIcons: ((T) -> List<ImageVector>)? = null,
+    optionLeadingContent: (@Composable (T) -> Unit)? = null,
+    onOptionSelected: (T) -> Unit,
+    enabled: Boolean = true,
+    colors: ToggleButtonColors = ToggleButtonDefaults.toggleButtonColors(),
+    layout: ConnectedButtonGroupLayout = ConnectedButtonGroupLayout.FLOW_ROW,
+    expandOptions: Boolean = false,
+    textStyle: TextStyle? = null,
+) {
+    val resolvedSelectedOption = resolveConnectedButtonSelection(options, selectedOption)
+    ConnectedButtonGroup(
+        modifier = modifier,
+        options = options,
+        isOptionSelected = { option -> option == resolvedSelectedOption },
+        optionLabel = optionLabel,
+        optionIcons = optionIcons,
+        optionLeadingContent = optionLeadingContent,
+        onOptionToggled = { option ->
+            if (option != resolvedSelectedOption) {
+                onOptionSelected(option)
+            }
+        },
+        enabled = enabled,
+        colors = colors,
+        layout = layout,
+        expandOptions = expandOptions,
+        textStyle = textStyle,
+    )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun <T> ConnectedButtonGroup(
+    modifier: Modifier = Modifier,
+    options: List<T>,
+    selectedOptions: Set<T>,
+    optionLabel: @Composable (T) -> String,
+    optionIcons: ((T) -> List<ImageVector>)? = null,
+    optionLeadingContent: (@Composable (T) -> Unit)? = null,
+    onOptionToggled: (T) -> Unit,
+    enabled: Boolean = true,
+    colors: ToggleButtonColors = ToggleButtonDefaults.toggleButtonColors(),
+    layout: ConnectedButtonGroupLayout = ConnectedButtonGroupLayout.FLOW_ROW,
+    expandOptions: Boolean = false,
+    textStyle: TextStyle? = null,
+) {
+    ConnectedButtonGroup(
+        modifier = modifier,
+        options = options,
+        isOptionSelected = { option -> option in selectedOptions },
+        optionLabel = optionLabel,
+        optionIcons = optionIcons,
+        optionLeadingContent = optionLeadingContent,
+        onOptionToggled = onOptionToggled,
+        enabled = enabled,
+        colors = colors,
+        layout = layout,
+        expandOptions = expandOptions,
+        textStyle = textStyle,
+    )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun <T> ConnectedButtonGroup(
+    modifier: Modifier = Modifier,
+    options: List<T>,
+    isOptionSelected: (T) -> Boolean,
+    optionLabel: @Composable (T) -> String,
+    optionIcons: ((T) -> List<ImageVector>)? = null,
+    optionLeadingContent: (@Composable (T) -> Unit)? = null,
+    onOptionToggled: (T) -> Unit,
+    enabled: Boolean = true,
+    colors: ToggleButtonColors = ToggleButtonDefaults.toggleButtonColors(),
+    layout: ConnectedButtonGroupLayout = ConnectedButtonGroupLayout.FLOW_ROW,
+    expandOptions: Boolean = false,
+    textStyle: TextStyle? = null,
+) {
+    val horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween)
+    val verticalArrangement = Arrangement.spacedBy(2.dp)
+
+    val localTextStyle = if (textStyle == null && !expandOptions) {
+        MaterialTheme.typography.labelMedium.copy(fontSize = 13.sp)
+    } else {
+        textStyle
+    }
+
+    // On a haze bottom sheet the default surfaceContainer container is only one tonal
+    // step above the sheet's translucent surfaceContainerLow material and blends in;
+    // lift unchecked buttons to surfaceContainerHigh for legible contrast.
+    val hazeSheet = hazeSheetBlurActive()
+    val resolvedColors = if (hazeSheet) {
+        colors.copy(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
+    } else {
+        colors
+    }
+
+    when (layout) {
+        ConnectedButtonGroupLayout.FLOW_ROW -> {
+            FlowRow(
+                modifier = modifier,
+                horizontalArrangement = horizontalArrangement,
+                verticalArrangement = verticalArrangement,
+            ) {
+                options.forEachIndexed { index, option ->
+                    ConnectedButtonGroupButton(
+                        option = option,
+                        index = index,
+                        optionCount = options.size,
+                        selected = isOptionSelected(option),
+                        optionLabel = optionLabel,
+                        optionIcons = optionIcons?.invoke(option).orEmpty(),
+                        optionLeadingContent = optionLeadingContent?.let { leadingContent ->
+                            { leadingContent(option) }
+                        },
+                        onOptionToggled = onOptionToggled,
+                        enabled = enabled,
+                        colors = resolvedColors,
+                        textStyle = localTextStyle,
+                    )
+                }
+            }
+        }
+
+        ConnectedButtonGroupLayout.ROW -> {
+            val rowModifier = if (expandOptions) {
+                modifier
+            } else {
+                modifier.horizontalScroll(rememberScrollState())
+            }
+            Row(
+                modifier = rowModifier,
+                horizontalArrangement = horizontalArrangement,
+            ) {
+                options.forEachIndexed { index, option ->
+                    val buttonModifier = if (expandOptions) {
+                        Modifier.weight(1f)
+                    } else {
+                        Modifier
+                    }
+                    ConnectedButtonGroupRowButton(
+                        modifier = buttonModifier,
+                        option = option,
+                        index = index,
+                        optionCount = options.size,
+                        selected = isOptionSelected(option),
+                        optionLabel = optionLabel,
+                        optionIcons = optionIcons?.invoke(option).orEmpty(),
+                        optionLeadingContent = optionLeadingContent?.let { leadingContent ->
+                            { leadingContent(option) }
+                        },
+                        onOptionToggled = onOptionToggled,
+                        enabled = enabled,
+                        colors = resolvedColors,
+                        textStyle = localTextStyle,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun <T> ConnectedButtonGroupButton(
+    modifier: Modifier = Modifier,
+    textStyle: TextStyle? = null,
+    option: T,
+    index: Int,
+    optionCount: Int,
+    selected: Boolean,
+    optionLabel: @Composable (T) -> String,
+    optionIcons: List<ImageVector>,
+    optionLeadingContent: (@Composable () -> Unit)?,
+    onOptionToggled: (T) -> Unit,
+    enabled: Boolean,
+    colors: ToggleButtonColors,
+) {
+    val hasStartIcon = connectedButtonGroupButtonHasStartIcon(
+        optionIconCount = optionIcons.size,
+        hasLeadingContent = optionLeadingContent != null,
+    )
+
+    ToggleButton(
+        modifier = modifier,
+        checked = selected,
+        onCheckedChange = { onOptionToggled(option) },
+        enabled = enabled || selected,
+        colors = colors,
+        contentPadding = ButtonDefaults.contentPaddingFor(
+            buttonHeight = ButtonDefaults.MinHeight,
+        ).minus(PaddingValues(start = if (hasStartIcon) 2.dp else 0.dp)),
+        shapes =
+            when (index) {
+                0 -> ButtonGroupDefaults.connectedLeadingButtonShapes()
+                optionCount - 1 -> ButtonGroupDefaults.connectedTrailingButtonShapes()
+                else -> ButtonGroupDefaults.connectedMiddleButtonShapes()
+            },
+    ) {
+        optionLeadingContent?.invoke()
+        if (optionLeadingContent != null) {
+            Spacer(modifier = Modifier.size(6.dp))
+        } else {
+            optionIcons.forEach { icon ->
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    modifier = Modifier.size(ToggleButtonDefaults.IconSize),
+                )
+                Spacer(modifier = Modifier.size(6.dp))
+            }
+        }
+        LocalizedButtonLabelText(
+            text = optionLabel(option),
+            textStyle = textStyle
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun <T> ConnectedButtonGroupRowButton(
+    modifier: Modifier = Modifier,
+    textStyle: TextStyle? = null,
+    option: T,
+    index: Int,
+    optionCount: Int,
+    selected: Boolean,
+    optionLabel: @Composable (T) -> String,
+    optionIcons: List<ImageVector>,
+    optionLeadingContent: (@Composable () -> Unit)?,
+    onOptionToggled: (T) -> Unit,
+    enabled: Boolean,
+    colors: ToggleButtonColors,
+) {
+    ConnectedButtonGroupButton(
+        modifier = modifier,
+        textStyle = textStyle,
+        option = option,
+        index = index,
+        optionCount = optionCount,
+        selected = selected,
+        optionLabel = optionLabel,
+        optionIcons = optionIcons,
+        optionLeadingContent = optionLeadingContent,
+        onOptionToggled = onOptionToggled,
+        enabled = enabled,
+        colors = colors,
+    )
+}
+
+internal fun <T> resolveConnectedButtonSelection(options: List<T>, selectedOption: T?): T? {
+    return options.firstOrNull { it == selectedOption } ?: options.firstOrNull()
+}
+
+internal fun connectedButtonGroupButtonHasStartIcon(
+    optionIconCount: Int,
+    hasLeadingContent: Boolean,
+): Boolean {
+    return hasLeadingContent || optionIconCount > 0
+}

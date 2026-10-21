@@ -1,0 +1,1271 @@
+package com.mkx.hrttracker.model.pk
+
+import com.mkx.hrttracker.model.medication.DoseInstruction
+import com.mkx.hrttracker.model.medication.DoseInstructionCalculator
+import com.mkx.hrttracker.model.medication.MedicationApplicationType
+import com.mkx.hrttracker.model.medication.MedicationCategory
+import com.mkx.hrttracker.model.medication.MedicationKey
+import com.mkx.hrttracker.model.medication.MedicationLogEntry
+import com.mkx.hrttracker.model.medication.Medicine
+import com.mkx.hrttracker.model.medication.MedicineIdentityKey
+import com.mkx.hrttracker.model.medication.MedicinePreparation
+import com.mkx.hrttracker.model.medication.MedicineSelection
+import com.mkx.hrttracker.model.medication.MedicineStock
+import com.mkx.hrttracker.model.medication.testInstant
+import com.mkx.hrttracker.model.medication.testMedicationLogEntry
+import com.mkx.hrttracker.model.medication.testMedicine
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.util.UUID
+import kotlin.math.exp
+
+class PkSimulationTest {
+    @Test
+    fun estradiolUndecylate_usesTransmtfImDepotV1Parameters() {
+        val depot = requireNotNull(PkCatalog.twoPartDepotParams(PkCompound.EU))
+
+        assertEquals(0.0, depot.fracFast, 0.0)
+        assertEquals(0.00082, depot.k1Fast, 0.0)
+        assertEquals(0.00082, depot.k1Slow, 0.0)
+        assertEquals(0.542, requireNotNull(PkCatalog.formationFraction(PkCompound.EU)), 0.0)
+        assertEquals(2.0, requireNotNull(PkCatalog.hydrolysisK2(PkCompound.EU)), 0.0)
+        assertEquals(272.38 / 440.66, PkCatalog.activeFactor(PkCompound.EU), 1e-12)
+    }
+
+    @Test
+    fun estradiolUndecylate_matchesSharedEngineLiteratureAnchors() {
+        fun event(day: Int) = PkDoseEvent(
+            id = UUID.randomUUID(),
+            sourceGroupUuid = null,
+            hormone = PkHormone.ESTRADIOL,
+            route = PkRoute.INJECTION,
+            timeH = day * 24.0,
+            doseMg = 100.0 * PkCatalog.activeFactor(PkCompound.EU),
+            compound = PkCompound.EU,
+        )
+
+        val singleDose = PkSimulationEngine(
+            events = listOf(event(day = 0)),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = 70.0,
+            startTimeH = 0.0,
+            endTimeH = 42.0 * 24.0,
+            numberOfSteps = 2,
+        ).run(sampleTimeH = listOf(24.0, 14.0 * 24.0, 42.0 * 24.0))
+
+        val day1 = requireNotNull(singleDose.concentrationAt(24.0))
+        val day14 = requireNotNull(singleDose.concentrationAt(14.0 * 24.0))
+        val day42 = requireNotNull(singleDose.concentrationAt(42.0 * 24.0))
+        assertTrue(day1 in 400.0..650.0)
+        assertTrue(day14 in 250.0..450.0)
+        assertTrue(day42 in 0.0..<day14)
+
+        val monthlyDoses = (0..6).map { month -> event(day = month * 30) }
+        val monthly = PkSimulationEngine(
+            events = monthlyDoses,
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = 70.0,
+            startTimeH = 0.0,
+            endTimeH = 180.0 * 24.0,
+            numberOfSteps = 2,
+        ).run(sampleTimeH = listOf(90.0 * 24.0, 180.0 * 24.0))
+
+        assertTrue(requireNotNull(monthly.concentrationAt(90.0 * 24.0)) in 400.0..600.0)
+        assertTrue(requireNotNull(monthly.concentrationAt(180.0 * 24.0)) in 450.0..650.0)
+    }
+
+    @Test
+    fun oralAndSublingualEstradiol_matchLiteratureAnchors() {
+        fun simulate(
+            route: PkRoute,
+            doseMg: Double,
+            days: Int,
+            sampleTimeH: List<Double>,
+            compound: PkCompound = PkCompound.E2,
+        ) =
+            PkSimulationEngine(
+                events = (0 until days).map { day ->
+                    PkDoseEvent(
+                        id = UUID.randomUUID(),
+                        sourceGroupUuid = null,
+                        hormone = PkHormone.ESTRADIOL,
+                        route = route,
+                        timeH = day * 24.0,
+                        doseMg = doseMg,
+                        compound = compound,
+                    )
+                },
+                hormone = PkHormone.ESTRADIOL,
+                bodyWeightKg = 70.0,
+                startTimeH = 0.0,
+                endTimeH = days * 24.0,
+                numberOfSteps = 2,
+            ).run(sampleTimeH = sampleTimeH)
+
+        // 2 mg/day steady state at 70 kg: 57 / 27 pg/mL peak / trough, spread 2.1x. Cattani 2023
+        // measured 62 / 35 on 2 mg valerate in trans women, including endogenous E2.
+        val oral = simulate(PkRoute.ORAL, 2.0, days = 10, listOf(9 * 24.0 + 5.0, 10 * 24.0))
+        val oralPeak = requireNotNull(oral.concentrationAt(9 * 24.0 + 5.0))
+        val oralTrough = requireNotNull(oral.concentrationAt(10 * 24.0))
+        assertTrue(oralPeak in 50.0..65.0)
+        assertTrue(oralTrough in 22.0..32.0)
+        assertTrue(oralPeak / oralTrough in 1.9..2.4)
+
+        // 1 mg sublingual at 1 h: 120 above baseline in Doll 2022, 441 in Price 1997. Both fall
+        // to ~0.15x of that by 4 h.
+        val sublingual = simulate(PkRoute.SUBLINGUAL, 1.0, days = 1, listOf(1.0, 4.0))
+        val oneHour = requireNotNull(sublingual.concentrationAt(1.0))
+        assertTrue(oneHour in 150.0..350.0)
+        assertTrue(requireNotNull(sublingual.concentrationAt(4.0)) / oneHour in 0.1..0.25)
+
+        // Estrana tape 0.72 mg (total-content entry): ~52-60 pg/mL in ~55 kg women, ~41 at 70 kg.
+        val estrana = simulate(PkRoute.PATCH_APPLY, 0.72, days = 1, listOf(0.0, 24.0))
+        assertTrue(requireNotNull(estrana.concentrationAt(24.0)) in 35.0..55.0)
+
+        // Gel 1.5 mg/day: Oestrogel UK SmPC day-12 average 76.8 pg/mL and the Melbourne trans
+        // cohort median 77.6, both including endogenous E2; the model averages 65 at 70 kg.
+        val gel = simulate(PkRoute.GEL, 1.5, days = 14, listOf(0.0, 13 * 24.0 + 12.0))
+        assertTrue(requireNotNull(gel.concentrationAt(13 * 24.0 + 12.0)) in 55.0..80.0)
+
+        // The swallowed limb's recycling share keeps a sublingual dose at or above the same-dose
+        // oral curve once the mouth-absorbed part is gone (Doll 2022, Price 1997, Fiet 1982).
+        val oralSingle = simulate(PkRoute.ORAL, 1.0, days = 1, listOf(8.0, 24.0))
+        val sublingualTail = simulate(PkRoute.SUBLINGUAL, 1.0, days = 1, listOf(8.0, 24.0))
+        for (t in listOf(8.0, 24.0)) {
+            val sl = requireNotNull(sublingualTail.concentrationAt(t))
+            val po = requireNotNull(oralSingle.concentrationAt(t))
+            assertTrue("sublingual $sl below oral $po at $t h", sl >= po)
+        }
+
+        // EV tracks E2 at equal E2 content on both routes.
+        for (route in listOf(PkRoute.ORAL, PkRoute.SUBLINGUAL)) {
+            val times = listOf(1.0, 6.0, 30.0)
+            assertEquals(
+                simulate(route, 1.0, days = 2, times).concentrations,
+                simulate(route, 1.0, days = 2, times, PkCompound.EV).concentrations,
+            )
+        }
+    }
+
+    @Test
+    fun estradiolCypionateInOil_peaksAroundDayFour() {
+        // Oriowo 1980 (arachis oil): 5 mg peaks on day 3.9 (2.4-6.2); Aly's oil fit gives 155 pg/mL
+        // at day 4.3. 5 mg of cypionate is 3.43 mg of estradiol.
+        val result = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = null,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.INJECTION,
+                    timeH = 0.0,
+                    doseMg = 5.0 * PkCatalog.activeFactor(PkCompound.EC),
+                    compound = PkCompound.EC,
+                ),
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = 70.0,
+            startTimeH = 0.0,
+            endTimeH = 28.0 * 24.0,
+            numberOfSteps = 2,
+        ).run(sampleTimeH = listOf(2.0 * 24.0, 3.8 * 24.0, 7.0 * 24.0, 14.0 * 24.0, 28.0 * 24.0))
+
+        val peak = requireNotNull(result.concentrationAt(3.8 * 24.0))
+        assertTrue(peak in 135.0..175.0)
+        assertTrue(peak > requireNotNull(result.concentrationAt(2.0 * 24.0)))
+        assertTrue(peak > requireNotNull(result.concentrationAt(7.0 * 24.0)))
+        assertTrue(requireNotNull(result.concentrationAt(14.0 * 24.0)) in 45.0..70.0)
+        assertTrue(requireNotNull(result.concentrationAt(28.0 * 24.0)) < 25.0)
+    }
+
+    @Test
+    fun oneCompartmentAmount_matchesBatemanEquation() {
+        val params = PkParams(
+            fracFast = 1.0,
+            k1Fast = 0.32,
+            k1Slow = 0.0,
+            k2 = 0.0,
+            k3 = 0.41,
+            bioavailability = 0.03,
+            rateMgH = 0.0,
+            fastBioavailability = 0.03,
+            slowBioavailability = 0.03,
+        )
+
+        val amount = ThreeCompartmentModel.oneCompartmentAmount(
+            tau = 1.0,
+            doseMg = 2.0,
+            p = params,
+        )
+
+        val expected = 2.0 * 0.03 * 0.32 / (0.32 - 0.41) *
+                (exp(-0.41) - exp(-0.32))
+        assertEquals(expected, amount, 1e-12)
+    }
+
+    @Test
+    fun patchAmount_zeroOrderDecaysAfterRemoval() {
+        val params = PkParams(
+            fracFast = 1.0,
+            k1Fast = 0.0,
+            k1Slow = 0.0,
+            k2 = 0.0,
+            k3 = 0.5,
+            bioavailability = 1.0,
+            rateMgH = 0.1,
+            fastBioavailability = 1.0,
+            slowBioavailability = 1.0,
+        )
+
+        val amount = ThreeCompartmentModel.patchAmount(
+            tau = 3.0,
+            doseMg = 0.0,
+            wearH = 2.0,
+            p = params,
+        )
+
+        val expectedAtRemoval = 0.1 / 0.5 * (1.0 - exp(-0.5 * 2.0))
+        val expected = expectedAtRemoval * exp(-0.5)
+        assertEquals(expected, amount, 1e-12)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_convertsInjectionDoseToActiveE2() {
+        val now = LocalDateTime.of(2026, 5, 5, 12, 0)
+        val zoneId = ZoneId.systemDefault()
+        val injectionAt = now.minusHours(48)
+        val bodyWeightKg = 70.0
+        val medicineDoseMg = 5.0
+        val entry = testMedicationLogEntry(
+            medicine = testMedicine(
+                key = MedicationKey.ESTRADIOL_VALERATE,
+                preparation = MedicinePreparation.InjectionSingleUseVial(
+                    strengthMgPerVial = medicineDoseMg,
+                ),
+            ),
+            applicationType = MedicationApplicationType.INJECTION,
+            doseInstruction = DoseInstruction.WholeUnit,
+            equivalentE2Mg = medicineDoseMg * PkCatalog.activeFactor(PkCompound.EV),
+            sourceGroupUuid = null,
+            appliedAt = testInstant(injectionAt),
+        )
+
+        val trend = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(entry),
+                bodyWeightKg = bodyWeightKg,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+        val expected = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = null,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.INJECTION,
+                    timeH = 36.0,
+                    doseMg = medicineDoseMg * PkCatalog.activeFactor(PkCompound.EV),
+                    compound = PkCompound.EV,
+                )
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = bodyWeightKg,
+            startTimeH = 0.0,
+            endTimeH = 168.0,
+            numberOfSteps = 169,
+        ).run(sampleTimeH = listOf(0.0, 84.0))
+
+        assertEquals(expected.concentrationAt(84.0) ?: 0.0, trend.currentConcentration, 1e-9)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_usesMedicationLogsAndBodyWeight() {
+        val now = LocalDateTime.of(2026, 5, 5, 12, 0)
+        val entry = testMedicationLogEntry(
+            medicine = testMedicine(
+                key = MedicationKey.ESTRADIOL,
+                preparation = MedicinePreparation.Pill(strengthMgPerTablet = 2.0),
+            ),
+            applicationType = MedicationApplicationType.ORAL,
+            doseInstruction = DoseInstruction.TabletFraction(1, 1),
+            equivalentE2Mg = 2.0,
+            sourceGroupUuid = null,
+            appliedAt = testInstant(now.minusMinutes(90).plusSeconds(12).plusNanos(345_000_000)),
+        )
+
+        val result = PkMedicationSimulation.simulateMainEstradiolTrend(
+            entries = listOf(entry),
+            bodyWeightKg = 50.0,
+            now = now,
+            zoneId = ZoneId.systemDefault(),
+        )
+
+        assertNotNull(result)
+        val trend = checkNotNull(result)
+        assertEquals(PkConcentrationUnit.PG_PER_ML, trend.concentrationUnit)
+        assertEquals(8, trend.dailyConcentrations.size)
+        assertEquals(1682, trend.chartConcentrations.size)
+        assertEquals(trend.chartTimeH.size, trend.chartConcentrations.size)
+        assertEquals(1, trend.chartSampleIntervalHours)
+        assertEquals(168, trend.chartWindowHours)
+        assertEquals(84.0, trend.predictionStartTimeH, 1e-9)
+        assertTrue(trend.chartTimeH.contains(82.0))
+        assertTrue(trend.chartTimeH.contains(82.5))
+        assertTrue(trend.chartTimeH.contains(82.5034))
+        assertEquals(
+            225,
+            trend.chartTimeH.count { timeH -> timeH > 60.0 && timeH < 82.5034 }
+        )
+        assertEquals(82.5034, trend.doseMarkers.single().timeH, 1e-9)
+        assertTrue(trend.currentConcentration > 0.0)
+        assertTrue(trend.chartConcentrations.last() < trend.currentConcentration)
+        assertTrue(checkNotNull(trend.chartConcentrations.maxOrNull()) > checkNotNull(trend.chartConcentrations.minOrNull()))
+        val currentIndex = trend.chartTimeH.indexOf(trend.predictionStartTimeH)
+        assertEquals(trend.currentConcentration, trend.chartConcentrations[currentIndex], 1e-9)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_usesDefaultBodyWeightWhenUnset() {
+        val result = PkMedicationSimulation.simulateMainEstradiolTrend(
+            entries = emptyList(),
+            bodyWeightKg = null,
+            now = LocalDateTime.of(2026, 5, 5, 12, 0),
+        )
+        val explicitDefaultResult = PkMedicationSimulation.simulateMainEstradiolTrend(
+            entries = emptyList(),
+            bodyWeightKg = 70.0,
+            now = LocalDateTime.of(2026, 5, 5, 12, 0),
+        )
+
+        assertNotNull(result)
+        assertEquals(explicitDefaultResult, result)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_excludesWindowEndMidnightDoseFromChart() {
+        val zoneId = ZoneId.of("Asia/Tokyo")
+        val now = LocalDateTime.of(2026, 5, 14, 12, 0)
+        val windowEnd = LocalDateTime.of(2026, 5, 18, 0, 0)
+        val doseAtWindowEnd = testMedicationLogEntry(
+            medicine = testMedicine(
+                key = MedicationKey.ESTRADIOL,
+                preparation = MedicinePreparation.Pill(strengthMgPerTablet = 2.0),
+            ),
+            applicationType = MedicationApplicationType.ORAL,
+            doseInstruction = DoseInstruction.TabletFraction(1, 1),
+            equivalentE2Mg = 2.0,
+            sourceGroupUuid = null,
+            appliedAt = windowEnd.atZone(zoneId).toInstant(),
+        )
+
+        val trend = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(doseAtWindowEnd),
+                bodyWeightKg = 70.0,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+
+        assertTrue(
+            "chart should stay before 168h, got ${trend.chartTimeH.lastOrNull()}",
+            trend.chartTimeH.all { timeH ->
+                timeH < PkMedicationSimulation.mainChartWindowHours.toDouble()
+            },
+        )
+        assertTrue(
+            "window-end dose marker leaked into chart",
+            trend.doseMarkers.none { marker ->
+                marker.timeH == PkMedicationSimulation.mainChartWindowHours.toDouble()
+            },
+        )
+    }
+
+    @Test
+    fun simulateMainEstradiolProjection_canServeLaterMainTrendFromCache() {
+        val zoneId = ZoneId.systemDefault()
+        val generatedAt = LocalDateTime.of(2026, 5, 5, 12, 0)
+        val laterLaunch = generatedAt.plusDays(2).plusHours(3)
+        val entries = listOf(
+            testMedicationLogEntry(
+                medicine = testMedicine(
+                    key = MedicationKey.ESTRADIOL_VALERATE,
+                    preparation = MedicinePreparation.InjectionSingleUseVial(
+                        strengthMgPerVial = 5.0,
+                    ),
+                ),
+                applicationType = MedicationApplicationType.INJECTION,
+                doseInstruction = DoseInstruction.WholeUnit,
+                equivalentE2Mg = 5.0 * PkCatalog.activeFactor(PkCompound.EV),
+                sourceGroupUuid = null,
+                appliedAt = testInstant(generatedAt.minusDays(2)),
+            ),
+            testMedicationLogEntry(
+                medicine = testMedicine(
+                    key = MedicationKey.ESTRADIOL,
+                    preparation = MedicinePreparation.Pill(strengthMgPerTablet = 2.0),
+                ),
+                applicationType = MedicationApplicationType.ORAL,
+                doseInstruction = DoseInstruction.TabletFraction(1, 1),
+                equivalentE2Mg = 2.0,
+                sourceGroupUuid = null,
+                appliedAt = testInstant(generatedAt.minusHours(6)),
+            )
+        )
+
+        val projection = PkMedicationSimulation.simulateMainEstradiolProjection(
+            entries = entries,
+            bodyWeightKg = 62.0,
+            windowDate = generatedAt.toLocalDate(),
+            zoneId = zoneId,
+            futureDays = 14,
+        )
+        val cachedTrend = checkNotNull(
+            projection.toMainEstradiolTrend(
+                now = laterLaunch,
+                zoneId = zoneId,
+            )
+        )
+        val directTrend = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = entries,
+                bodyWeightKg = 62.0,
+                now = laterLaunch,
+                zoneId = zoneId,
+            )
+        )
+
+        assertEquals(directTrend.currentConcentration, cachedTrend.currentConcentration, 1e-9)
+        assertEquals(
+            directTrend.previousDayConcentration,
+            cachedTrend.previousDayConcentration,
+            1e-9
+        )
+        assertEquals(directTrend.dailyConcentrations, cachedTrend.dailyConcentrations)
+        assertEquals(directTrend.chartWindowHours, cachedTrend.chartWindowHours)
+        assertEquals(directTrend.predictionStartTimeH, cachedTrend.predictionStartTimeH, 1e-9)
+    }
+
+    @Test
+    fun projectionToMainEstradiolTrend_excludesWindowEndMidnightDoseFromChart() {
+        val zoneId = ZoneId.of("Asia/Tokyo")
+        val generatedAt = LocalDateTime.of(2026, 5, 14, 12, 0)
+        val windowEnd = LocalDateTime.of(2026, 5, 18, 0, 0)
+        val doseAtWindowEnd = testMedicationLogEntry(
+            medicine = testMedicine(
+                key = MedicationKey.ESTRADIOL,
+                preparation = MedicinePreparation.Pill(strengthMgPerTablet = 2.0),
+            ),
+            applicationType = MedicationApplicationType.ORAL,
+            doseInstruction = DoseInstruction.TabletFraction(1, 1),
+            equivalentE2Mg = 2.0,
+            sourceGroupUuid = null,
+            appliedAt = windowEnd.atZone(zoneId).toInstant(),
+        )
+        val projection = PkMedicationSimulation.simulateMainEstradiolProjection(
+            entries = listOf(doseAtWindowEnd),
+            bodyWeightKg = 70.0,
+            windowDate = generatedAt.toLocalDate(),
+            zoneId = zoneId,
+            futureDays = 4,
+        )
+
+        val trend = checkNotNull(
+            projection.toMainEstradiolTrend(
+                now = generatedAt,
+                zoneId = zoneId,
+            )
+        )
+
+        assertTrue(
+            "chart should stay before 168h, got ${trend.chartTimeH.lastOrNull()}",
+            trend.chartTimeH.all { timeH ->
+                timeH < PkMedicationSimulation.mainChartWindowHours.toDouble()
+            },
+        )
+        assertTrue(
+            "window-end dose marker leaked into chart",
+            trend.doseMarkers.none { marker ->
+                marker.timeH == PkMedicationSimulation.mainChartWindowHours.toDouble()
+            },
+        )
+    }
+
+    @Test
+    fun patchSimulation_pairsAcrossGroupsForRemoveAll() {
+        val groupA = UUID.randomUUID()
+        val groupB = UUID.randomUUID()
+        val releaseRate = 50.0
+
+        fun simulate(events: List<PkDoseEvent>): List<Double> {
+            return PkSimulationEngine(
+                events = events,
+                hormone = PkHormone.ESTRADIOL,
+                bodyWeightKg = 70.0,
+                startTimeH = 0.0,
+                endTimeH = 200.0,
+                numberOfSteps = 201,
+            ).run(sampleTimeH = listOf(0.0, 84.0, 150.0)).concentrations
+        }
+
+        val crossGroup = simulate(
+            listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 0.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupB,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_REMOVE,
+                    timeH = 84.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                ),
+            )
+        )
+        val sameGroup = simulate(
+            listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 0.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_REMOVE,
+                    timeH = 84.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                ),
+            )
+        )
+
+        assertEquals(sameGroup, crossGroup)
+        // Sanity: the patch must actually have been removed — concentration at
+        // t=150 should be strictly lower than at t=84 (decay phase).
+        assertTrue(crossGroup[2] < crossGroup[1])
+    }
+
+    @Test
+    fun patchSimulation_removeAtSameInstantAsApplyPairsWithPreviousApply() {
+        // Logging "remove old patch" and "apply new patch" at the same instant
+        // (common when swapping patches) must pair the remove with the previous
+        // apply, not the new one — the new patch should still be on at the end
+        // of the run.
+        val groupA = UUID.randomUUID()
+        val releaseRate = 50.0
+
+        val swapResult = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 0.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_REMOVE,
+                    timeH = 168.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                ),
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 168.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = 70.0,
+            startTimeH = 0.0,
+            endTimeH = 400.0,
+            numberOfSteps = 401,
+        ).run(sampleTimeH = listOf(0.0, 168.0, 200.0))
+
+        // Equivalent decomposition: a removed first patch + a still-on second patch.
+        // The sum of the two single-event runs must match the combined run, which
+        // is only true if the REMOVE bound the FIRST apply (not the second one).
+        val firstPatchOnly = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 0.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_REMOVE,
+                    timeH = 168.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                ),
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = 70.0,
+            startTimeH = 0.0,
+            endTimeH = 400.0,
+            numberOfSteps = 401,
+        ).run(sampleTimeH = listOf(0.0, 168.0, 200.0))
+        val secondPatchOnly = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 168.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = 70.0,
+            startTimeH = 0.0,
+            endTimeH = 400.0,
+            numberOfSteps = 401,
+        ).run(sampleTimeH = listOf(0.0, 168.0, 200.0))
+
+        for (timeH in listOf(0.0, 168.0, 200.0)) {
+            val expected = (firstPatchOnly.concentrationAt(timeH) ?: 0.0) +
+                    (secondPatchOnly.concentrationAt(timeH) ?: 0.0)
+            val actual = swapResult.concentrationAt(timeH) ?: 0.0
+            assertEquals("at t=$timeH", expected, actual, 1e-9)
+        }
+        // Sanity: at t=200 the second (still-on) patch must dominate.
+        assertTrue((secondPatchOnly.concentrationAt(200.0) ?: 0.0) > 0.0)
+    }
+
+    @Test
+    fun patchSimulation_unmatchedApplyKeepsReleasingIndefinitely() {
+        // Without an explicit PATCH_REMOVE, a patch wears forever. The engine
+        // does not infer a removal from a later PATCH_APPLY — users who don't
+        // log removals must accept that their PK projection shows an indefinitely
+        // worn patch.
+        val groupA = UUID.randomUUID()
+        val releaseRate = 50.0
+
+        val unmatchedResult = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 0.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 168.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = 70.0,
+            startTimeH = 0.0,
+            endTimeH = 400.0,
+            numberOfSteps = 401,
+        ).run(sampleTimeH = listOf(0.0, 200.0, 400.0))
+
+        // The first patch should still be saturating at zero-order rate (no
+        // implicit removal at t=168). A test for that: concentration at t=400
+        // must exceed any pure-decay scenario where the patch was actually
+        // removed.
+        val firstStaysOn = unmatchedResult.concentrationAt(400.0) ?: 0.0
+        val removedAt168 = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 0.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_REMOVE,
+                    timeH = 168.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                ),
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = groupA,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.PATCH_APPLY,
+                    timeH = 168.0,
+                    doseMg = 0.0,
+                    compound = PkCompound.E2,
+                    releaseRateMcgPerDay = releaseRate,
+                ),
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = 70.0,
+            startTimeH = 0.0,
+            endTimeH = 400.0,
+            numberOfSteps = 401,
+        ).run(sampleTimeH = listOf(0.0, 200.0, 400.0)).concentrationAt(400.0) ?: 0.0
+
+        assertTrue(firstStaysOn > removedAt168)
+    }
+
+    @Test
+    fun simulateMainEstradiolProjection_windowMatchesHomeSnapshotChartBounds() {
+        val zoneId = ZoneId.of("Asia/Tokyo")
+        val generatedAt = LocalDateTime.of(2026, 5, 8, 14, 27)
+
+        for (option in HomeE2ChartWindowOption.entries) {
+            val projection = PkMedicationSimulation.simulateMainEstradiolProjection(
+                entries = emptyList(),
+                bodyWeightKg = 70.0,
+                windowDate = generatedAt.toLocalDate(),
+                zoneId = zoneId,
+                option = option,
+            )
+
+            val expectedWindowStart = generatedAt.toLocalDate().atStartOfDay()
+                .minusDays(option.pastDays)
+                .atZone(zoneId)
+                .toInstant()
+            val expectedWindowEnd = generatedAt.toLocalDate()
+                .plusDays(option.projectionFutureDays())
+                .atStartOfDay()
+                .atZone(zoneId)
+                .toInstant()
+            assertEquals(
+                "windowStart mismatch for $option",
+                expectedWindowStart,
+                projection.windowStart,
+            )
+            assertEquals(
+                "windowEnd mismatch for $option",
+                expectedWindowEnd,
+                projection.windowEnd,
+            )
+        }
+    }
+
+    @Test
+    fun simulateMainEstradiolProjection_thirtyDays_usesBudgetSampler() {
+        // 30-day projection spans 40 d (16 past + 14 future + 10 buffer). The
+        // budget sampler emits segmentCount + 1 = 2241 dense samples; dose
+        // times and their post-dose offsets are unioned in, but the count
+        // should not balloon to interval-style counts.
+        val zoneId = ZoneId.of("Asia/Tokyo")
+        val generatedAt = LocalDateTime.of(2026, 5, 8, 14, 27)
+        val projection = PkMedicationSimulation.simulateMainEstradiolProjection(
+            entries = emptyList(),
+            bodyWeightKg = 70.0,
+            windowDate = generatedAt.toLocalDate(),
+            zoneId = zoneId,
+            option = HomeE2ChartWindowOption.THIRTY_DAYS,
+        )
+
+        // No doses and no sample at the generation time: exactly the budget,
+        // well below the interval-grid count of (40*24/0.1)+1 = 9601.
+        assertEquals(2241, projection.timeH.size)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_thirtyDays_injectsPostDoseOffsets() {
+        // Oral E2 has a sub-hour Tmax, which sits between budget-sampler grid
+        // samples at 26-min spacing. THIRTY_DAYS injects post-dose offsets so
+        // the absorption phase is sampled exactly.
+        val zoneId = ZoneId.of("Asia/Tokyo")
+        val now = LocalDateTime.of(2026, 5, 17, 12, 0)
+        val doseAt = now.minusHours(72)
+        val entries = listOf(
+            testMedicationLogEntry(
+                medicine = testMedicine(
+                    key = MedicationKey.ESTRADIOL,
+                    preparation = MedicinePreparation.Pill(strengthMgPerTablet = 2.0),
+                ),
+                applicationType = MedicationApplicationType.ORAL,
+                doseInstruction = DoseInstruction.TabletFraction(1, 1),
+                equivalentE2Mg = 2.0,
+                sourceGroupUuid = null,
+                appliedAt = doseAt.atZone(zoneId).toInstant(),
+            )
+        )
+
+        val thirtyDayResult = PkMedicationSimulation.simulateMainEstradiolTrend(
+            entries = entries,
+            bodyWeightKg = 70.0,
+            now = now,
+            zoneId = zoneId,
+            option = HomeE2ChartWindowOption.THIRTY_DAYS,
+        )
+        val sevenDayResult = PkMedicationSimulation.simulateMainEstradiolTrend(
+            entries = entries,
+            bodyWeightKg = 70.0,
+            now = now,
+            zoneId = zoneId,
+            option = HomeE2ChartWindowOption.SEVEN_DAYS,
+        )
+        assertNotNull(thirtyDayResult)
+        assertNotNull(sevenDayResult)
+
+        // The dose is 72 h before `now = midnight + 12h`, so its timeH is
+        // (pastDays * 24 + 12) − 72 = (pastDays * 24 − 60) h from the chart
+        // window start. THIRTY_DAYS adds exact post-dose offsets; SEVEN_DAYS
+        // uses the 0.1 h interval sampler, which lands on multiples of 0.1.
+        val thirtyDoseOffsetH = HomeE2ChartWindowOption.THIRTY_DAYS.pastDays * 24.0 - 60.0
+        val sevenDoseOffsetH = HomeE2ChartWindowOption.SEVEN_DAYS.pastDays * 24.0 - 60.0
+        val thirtyTimes = thirtyDayResult!!.chartTimeH.toSet()
+        val sevenTimes = sevenDayResult!!.chartTimeH.toSet()
+        for (offset in listOf(0.25, 0.5, 1.0)) {
+            val thirtyExpected = round4(thirtyDoseOffsetH + offset)
+            assertTrue(
+                "THIRTY_DAYS expected post-dose sample at $thirtyExpected h",
+                thirtyTimes.contains(thirtyExpected),
+            )
+        }
+        // Only +0.25 h is guaranteed off the SEVEN_DAYS 0.1 h interval grid.
+        val sevenContrast = round4(sevenDoseOffsetH + 0.25)
+        assertTrue(
+            "SEVEN_DAYS unexpectedly contains exact +0.25 h post-dose offset at $sevenContrast h",
+            !sevenTimes.contains(sevenContrast),
+        )
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_totalMgPatchYieldsNonZeroDose() {
+        // Regression: a TotalMg patch must drive PK off its patch spec —
+        // DoseInstructionCalculator.perUnitEquivalentE2Mg returns null for every
+        // patch, so a naive equivalentE2Mg rewrite would silently drop it.
+        val now = LocalDateTime.of(2026, 5, 17, 12, 0)
+        val zoneId = ZoneId.systemDefault()
+        val patchEntry = testMedicationLogEntry(
+            medicine = testMedicine(
+                key = MedicationKey.ESTRADIOL_PATCH,
+                preparation = MedicinePreparation.Patch(
+                    specification = MedicinePreparation.PatchSpecification.TotalMg(valueMg = 4.0),
+                ),
+            ),
+            applicationType = MedicationApplicationType.PATCH_ON,
+            doseInstruction = DoseInstruction.WholeUnit,
+            equivalentE2Mg = null,
+            sourceGroupUuid = null,
+            appliedAt = now.minusHours(48).atZone(zoneId).toInstant(),
+        )
+
+        val trend = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(patchEntry),
+                bodyWeightKg = 70.0,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+
+        assertTrue(
+            "TotalMg patch produced no dose marker — its dose was dropped",
+            trend.doseMarkers.isNotEmpty(),
+        )
+        assertTrue(trend.currentConcentration > 0.0)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_releaseRatePatchYieldsNonZeroLevel() {
+        // Regression: a ReleaseRateMcgPerDay patch must drive PK off its
+        // release-rate spec via PkDoseEvent.releaseRateMcgPerDay.
+        val now = LocalDateTime.of(2026, 5, 17, 12, 0)
+        val zoneId = ZoneId.systemDefault()
+        val patchEntry = testMedicationLogEntry(
+            medicine = testMedicine(
+                key = MedicationKey.ESTRADIOL_PATCH,
+                preparation = MedicinePreparation.Patch(
+                    specification = MedicinePreparation.PatchSpecification
+                        .ReleaseRateMcgPerDay(valueMcgPerDay = 100.0),
+                ),
+            ),
+            applicationType = MedicationApplicationType.PATCH_ON,
+            doseInstruction = DoseInstruction.WholeUnit,
+            equivalentE2Mg = null,
+            sourceGroupUuid = null,
+            appliedAt = now.minusHours(48).atZone(zoneId).toInstant(),
+        )
+
+        val trend = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(patchEntry),
+                bodyWeightKg = 70.0,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+
+        assertTrue(
+            "ReleaseRate patch produced no dose marker — its release rate was dropped",
+            trend.doseMarkers.isNotEmpty(),
+        )
+        assertTrue(trend.currentConcentration > 0.0)
+    }
+
+    @Test
+    fun patchOffEntryWithSingletonMedicineStillRemovesPatch() {
+        // After the singleton refactor a PATCH_OFF log carries the global
+        // PatchOff medicine instead of null. The simulator must still route
+        // it as an estradiol patch removal (the route alone determines this).
+        val zoneId = ZoneId.systemDefault()
+        val now = LocalDateTime.of(2026, 5, 17, 12, 0)
+        val applyEntry: MedicationLogEntry = testMedicationLogEntry(
+            medicine = testMedicine(
+                key = MedicationKey.ESTRADIOL_PATCH,
+                preparation = MedicinePreparation.Patch(
+                    specification = MedicinePreparation.PatchSpecification
+                        .ReleaseRateMcgPerDay(valueMcgPerDay = 100.0),
+                ),
+            ),
+            applicationType = MedicationApplicationType.PATCH_ON,
+            doseInstruction = DoseInstruction.WholeUnit,
+            equivalentE2Mg = null,
+            sourceGroupUuid = null,
+            appliedAt = now.minusHours(72).atZone(zoneId).toInstant(),
+        )
+        val removeEntry: MedicationLogEntry = MedicationLogEntry(
+            uuid = UUID.randomUUID(),
+            medicine = com.mkx.hrttracker.model.medication.testPatchOffMedicine(),
+            category = MedicationCategory.ESTRADIOL,
+            applicationType = MedicationApplicationType.PATCH_OFF,
+            doseInstruction = DoseInstruction.Noop,
+            equivalentE2Mg = null,
+            sourceGroupUuid = null,
+            appliedAt = now.minusHours(24).atZone(zoneId).toInstant(),
+        )
+
+        val withRemoval = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(applyEntry, removeEntry),
+                bodyWeightKg = 70.0,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+        val withoutRemoval = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(applyEntry),
+                bodyWeightKg = 70.0,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+
+        assertTrue(withRemoval.currentConcentration < withoutRemoval.currentConcentration)
+    }
+
+    @Test
+    fun patchOffEntryWithoutMedicineIsRemovalOfEstradiol() {
+        // A PATCH_OFF log carries no medicine; it must still pair as an
+        // estradiol patch removal (not be dropped for lack of a compound).
+        val zoneId = ZoneId.systemDefault()
+        val now = LocalDateTime.of(2026, 5, 17, 12, 0)
+        val applyEntry: MedicationLogEntry = testMedicationLogEntry(
+            medicine = testMedicine(
+                key = MedicationKey.ESTRADIOL_PATCH,
+                preparation = MedicinePreparation.Patch(
+                    specification = MedicinePreparation.PatchSpecification
+                        .ReleaseRateMcgPerDay(valueMcgPerDay = 100.0),
+                ),
+            ),
+            applicationType = MedicationApplicationType.PATCH_ON,
+            doseInstruction = DoseInstruction.WholeUnit,
+            equivalentE2Mg = null,
+            sourceGroupUuid = null,
+            appliedAt = now.minusHours(72).atZone(zoneId).toInstant(),
+        )
+        val removeEntry: MedicationLogEntry = MedicationLogEntry(
+            uuid = UUID.randomUUID(),
+            medicine = null,
+            category = MedicationCategory.ESTRADIOL,
+            applicationType = MedicationApplicationType.PATCH_OFF,
+            doseInstruction = DoseInstruction.Noop,
+            equivalentE2Mg = null,
+            sourceGroupUuid = null,
+            appliedAt = now.minusHours(24).atZone(zoneId).toInstant(),
+        )
+
+        val withRemoval = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(applyEntry, removeEntry),
+                bodyWeightKg = 70.0,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+        val withoutRemoval = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(applyEntry),
+                bodyWeightKg = 70.0,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+
+        // Removing the patch must lower the level vs. leaving it on.
+        assertTrue(withRemoval.currentConcentration < withoutRemoval.currentConcentration)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_usesImportedEvInjectionDepotKinetics() {
+        val now = LocalDateTime.of(2026, 5, 5, 12, 0)
+        val zoneId = ZoneId.systemDefault()
+        val bodyWeightKg = 70.0
+        val medicineDoseMg = 5.0
+        val entry = testMedicationLogEntry(
+            medicine = importedMedicine(
+                preparation = MedicinePreparation.ImportedInjection(
+                    administeredMg = medicineDoseMg,
+                    ester = MedicationKey.ESTRADIOL_VALERATE,
+                ),
+                applicationType = MedicationApplicationType.INJECTION,
+                compound = "ESTRADIOL_VALERATE",
+                doseKey = "5",
+            ),
+            applicationType = MedicationApplicationType.INJECTION,
+            doseInstruction = DoseInstruction.WholeUnit,
+            equivalentE2Mg = null,
+            sourceGroupUuid = null,
+            appliedAt = testInstant(now.minusHours(48)),
+        )
+
+        val trend = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(entry),
+                bodyWeightKg = bodyWeightKg,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+        val equivalentE2Mg = medicineDoseMg * requireNotNull(
+            DoseInstructionCalculator.e2EquivalenceRatio(MedicationKey.ESTRADIOL_VALERATE)
+        )
+        val expected = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = null,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.INJECTION,
+                    timeH = 36.0,
+                    doseMg = equivalentE2Mg,
+                    compound = PkCompound.EV,
+                )
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = bodyWeightKg,
+            startTimeH = 0.0,
+            endTimeH = 168.0,
+            numberOfSteps = 169,
+        ).run(sampleTimeH = listOf(0.0, 84.0))
+
+        assertEquals(expected.concentrationAt(84.0) ?: 0.0, trend.currentConcentration, 1e-9)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_usesImportedGelKinetics() {
+        val now = LocalDateTime.of(2026, 5, 5, 12, 0)
+        val zoneId = ZoneId.systemDefault()
+        val bodyWeightKg = 70.0
+        val appliedEstradiolMg = 1.5
+        val entry = testMedicationLogEntry(
+            medicine = importedMedicine(
+                preparation = MedicinePreparation.ImportedGel(
+                    appliedEstradiolMg = appliedEstradiolMg,
+                ),
+                applicationType = MedicationApplicationType.GEL,
+                compound = "ESTRADIOL_GEL",
+                doseKey = "1.5",
+            ),
+            applicationType = MedicationApplicationType.GEL,
+            doseInstruction = DoseInstruction.WholeUnit,
+            equivalentE2Mg = null,
+            sourceGroupUuid = null,
+            appliedAt = testInstant(now.minusHours(8)),
+        )
+
+        val trend = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = listOf(entry),
+                bodyWeightKg = bodyWeightKg,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+        val expected = PkSimulationEngine(
+            events = listOf(
+                PkDoseEvent(
+                    id = UUID.randomUUID(),
+                    sourceGroupUuid = null,
+                    hormone = PkHormone.ESTRADIOL,
+                    route = PkRoute.GEL,
+                    timeH = 76.0,
+                    doseMg = appliedEstradiolMg,
+                    compound = PkCompound.E2,
+                )
+            ),
+            hormone = PkHormone.ESTRADIOL,
+            bodyWeightKg = bodyWeightKg,
+            startTimeH = 0.0,
+            endTimeH = 168.0,
+            numberOfSteps = 169,
+        ).run(sampleTimeH = listOf(0.0, 84.0))
+
+        assertEquals(expected.concentrationAt(84.0) ?: 0.0, trend.currentConcentration, 1e-9)
+    }
+
+    @Test
+    fun simulateMainEstradiolTrend_keepsImportedCatalogPillsAndPatches() {
+        val now = LocalDateTime.of(2026, 5, 17, 12, 0)
+        val zoneId = ZoneId.systemDefault()
+        val entries = listOf(
+            testMedicationLogEntry(
+                medicine = importedMedicine(
+                    selection = MedicineSelection.Catalog(MedicationKey.ESTRADIOL_VALERATE),
+                    preparation = MedicinePreparation.Pill(strengthMgPerTablet = 2.0),
+                    applicationType = MedicationApplicationType.ORAL,
+                    compound = "ESTRADIOL_VALERATE",
+                    doseKey = "2",
+                ),
+                applicationType = MedicationApplicationType.ORAL,
+                doseInstruction = DoseInstruction.TabletFraction(numerator = 1, denominator = 1),
+                equivalentE2Mg = null,
+                sourceGroupUuid = null,
+                appliedAt = now.minusHours(36).atZone(zoneId).toInstant(),
+            ),
+            testMedicationLogEntry(
+                medicine = importedMedicine(
+                    selection = MedicineSelection.Catalog(MedicationKey.ESTRADIOL),
+                    preparation = MedicinePreparation.Pill(strengthMgPerTablet = 1.0),
+                    applicationType = MedicationApplicationType.SUBLINGUAL,
+                    compound = "ESTRADIOL",
+                    doseKey = "1",
+                ),
+                applicationType = MedicationApplicationType.SUBLINGUAL,
+                doseInstruction = DoseInstruction.TabletFraction(numerator = 1, denominator = 1),
+                equivalentE2Mg = null,
+                sourceGroupUuid = null,
+                appliedAt = now.minusHours(24).atZone(zoneId).toInstant(),
+            ),
+            testMedicationLogEntry(
+                medicine = importedMedicine(
+                    selection = MedicineSelection.Catalog(MedicationKey.ESTRADIOL_PATCH),
+                    preparation = MedicinePreparation.Patch(
+                        specification = MedicinePreparation.PatchSpecification.ReleaseRateMcgPerDay(
+                            valueMcgPerDay = 100.0,
+                        ),
+                    ),
+                    applicationType = MedicationApplicationType.PATCH_ON,
+                    compound = "ESTRADIOL_PATCH",
+                    doseKey = "100mcgPerDay",
+                ),
+                applicationType = MedicationApplicationType.PATCH_ON,
+                doseInstruction = DoseInstruction.WholeUnit,
+                equivalentE2Mg = null,
+                sourceGroupUuid = null,
+                appliedAt = now.minusHours(12).atZone(zoneId).toInstant(),
+            ),
+        )
+
+        val trend = checkNotNull(
+            PkMedicationSimulation.simulateMainEstradiolTrend(
+                entries = entries,
+                bodyWeightKg = 70.0,
+                now = now,
+                zoneId = zoneId,
+            )
+        )
+
+        assertEquals(3, trend.doseMarkers.size)
+        assertTrue(trend.currentConcentration > 0.0)
+    }
+
+    private fun round4(value: Double): Double {
+        // Mirrors PkMedicationSimulation.toChartXHour rounding scale.
+        return kotlin.math.round(value * 10_000.0) / 10_000.0
+    }
+
+    private fun importedMedicine(
+        preparation: MedicinePreparation,
+        applicationType: MedicationApplicationType,
+        compound: String,
+        doseKey: String,
+        selection: MedicineSelection = MedicineSelection.Custom("External tracker"),
+    ): Medicine {
+        return Medicine(
+            uuid = UUID.randomUUID(),
+            selection = selection,
+            category = when (selection) {
+                is MedicineSelection.Catalog -> selection.medicationKey.category
+                is MedicineSelection.Custom -> MedicationCategory.ESTRADIOL
+                is MedicineSelection.PatchOff -> MedicationCategory.ESTRADIOL
+            },
+            preparation = preparation,
+            displayName = null,
+            identityKey = MedicineIdentityKey.external(
+                sourceApp = "NoMTF",
+                applicationType = applicationType,
+                compound = compound,
+                doseKey = doseKey,
+            ),
+            createdAt = testInstant(LocalDateTime.of(2026, 5, 1, 0, 0)),
+            updatedAt = testInstant(LocalDateTime.of(2026, 5, 1, 0, 0)),
+            archivedAt = null,
+            stock = MedicineStock(),
+            importedFromExternalTracker = true,
+        )
+    }
+}

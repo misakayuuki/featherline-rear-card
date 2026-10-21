@@ -1,0 +1,660 @@
+package com.mkx.hrttracker.ui.plan
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.mkx.hrttracker.data.repository.MedicationGroupRepository
+import com.mkx.hrttracker.data.repository.MedicationLogEntryInput
+import com.mkx.hrttracker.data.repository.MedicationLogRepository
+import com.mkx.hrttracker.data.repository.MedicineStockRepository
+import com.mkx.hrttracker.data.repository.SettingsRepository
+import com.mkx.hrttracker.data.repository.deductInsertedDoseStock
+import com.mkx.hrttracker.data.repository.resolveRequestedDoseForStock
+import com.mkx.hrttracker.model.medication.DoseInstruction
+import com.mkx.hrttracker.model.medication.MedicationApplicationType
+import com.mkx.hrttracker.model.medication.MedicationGroup
+import com.mkx.hrttracker.model.medication.MedicationGroupColorKey
+import com.mkx.hrttracker.model.medication.MedicationGroupSchedule
+import com.mkx.hrttracker.model.medication.MedicationGroupScheduleType
+import com.mkx.hrttracker.model.medication.MedicationLogEntry
+import com.mkx.hrttracker.model.medication.Medicine
+import com.mkx.hrttracker.model.medication.MedicineStock
+import com.mkx.hrttracker.model.medication.MedicineStockProjection
+import com.mkx.hrttracker.model.medication.MedicineStockState
+import com.mkx.hrttracker.model.medication.RunwayProjection
+import com.mkx.hrttracker.model.medication.isActive
+import com.mkx.hrttracker.model.medication.ownsUnloggedOccurrence
+import com.mkx.hrttracker.reminder.MedicationReminderScheduler
+import com.mkx.hrttracker.reminder.PostLogStockWarning
+import com.mkx.hrttracker.reminder.captureStockStatesForLog
+import com.mkx.hrttracker.reminder.resolvePostLogStockWarning
+import com.mkx.hrttracker.util.AppTimeSource
+import com.mkx.hrttracker.util.systemLocale
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.time.DayOfWeek
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.temporal.ChronoUnit
+import java.util.UUID
+import javax.inject.Inject
+
+@HiltViewModel
+class PlanBatchAddViewModel @Inject constructor(
+    private val medicationGroupRepository: MedicationGroupRepository,
+    private val medicationLogRepository: MedicationLogRepository,
+    private val medicineStockRepository: MedicineStockRepository,
+    private val medicationReminderScheduler: MedicationReminderScheduler,
+    settingsRepository: SettingsRepository,
+    appTimeSource: AppTimeSource,
+) : ViewModel() {
+    private val selectionState = MutableStateFlow(PlanBatchAddSelectionState())
+
+    // Drives `today`/`now` so date-derived state (the date-range picker's upper
+    // bound, the future-start guard) stays fresh while the screen is open —
+    // currentMinute ticks each minute and re-reads on foreground/clock changes.
+    private val currentDateTime = appTimeSource.currentMinute
+
+    private val stockProjections = medicineStockRepository.observeProjections()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = medicineStockRepository.getCachedProjections().orEmpty(),
+        )
+
+    private val selectionAndStock = combine(
+        selectionState,
+        stockProjections,
+    ) { selection, projections ->
+        selection to projections
+    }
+
+    val uiState: StateFlow<PlanBatchAddUiState> = combine(
+        medicationGroupRepository.observeGroups(),
+        medicationLogRepository.observeEntries(),
+        settingsRepository.settingsState,
+        selectionAndStock,
+        currentDateTime,
+    ) { groupsOrNull, entriesOrNull, settingsState, selectionWithProjections, now ->
+        val (selection, projections) = selectionWithProjections
+        val groups =
+            sortPlanMedicationGroups(groupsOrNull.orEmpty().filter(MedicationGroup::isActive))
+        val entries = entriesOrNull.orEmpty()
+        val selectedGroup = selection.selectedGroupUuid?.let { groupUuid ->
+            groups.firstOrNull { group -> group.uuid == groupUuid }
+        }
+        val today = now.toLocalDate()
+        // A not-yet-started plan (future `since`) has no past occurrences to
+        // backfill, and defaulting startDate to `since` would invert the range
+        // (start after end). Flag it so the UI shows a prompt instead.
+        val selectedGroupStartsInFuture = selectedGroup != null &&
+                selectedGroup.schedule.since.isAfter(today)
+        val selectedGroupHasTrackedMedicine = selectedGroup != null && run {
+            val groupMedicineUuids = selectedGroup.medications
+                .mapNotNullTo(mutableSetOf()) { medication -> medication.medicine?.uuid }
+            projections.any { projection ->
+                projection.medicine.uuid in groupMedicineUuids &&
+                        projection.medicine.stock.trackingEnabled
+            }
+        }
+        val startDate = selection.startDate ?: selectedGroup?.schedule?.since ?: today
+        val endDate = selection.endDate ?: today
+        val entryPlan = if (selectedGroup != null) {
+            buildPlanBatchAddEntryPlan(
+                group = selectedGroup,
+                existingEntries = entries,
+                startDate = startDate,
+                endDate = endDate,
+                now = now,
+            )
+        } else {
+            PlanBatchAddEntryPlan()
+        }
+        // Built regardless of the toggle so the switch's supporting text can
+        // report how many medicines would change stock before it is flipped on.
+        val stockPreviewItems = buildPlanBatchAddStockPreviewItems(
+            entriesToAdd = entryPlan.entries,
+            stockProjections = projections,
+        )
+        val deductStockAvailability = when {
+            selectedGroup == null -> DeductStockAvailability.NO_GROUP
+            !selectedGroupHasTrackedMedicine -> DeductStockAvailability.NONE_TRACKED
+            selectedGroupStartsInFuture -> DeductStockAvailability.NOT_STARTED
+            stockPreviewItems.isEmpty() -> DeductStockAvailability.NO_CHANGES
+            else -> DeductStockAvailability.AVAILABLE
+        }
+
+        PlanBatchAddUiState(
+            isLoading = groupsOrNull == null || entriesOrNull == null,
+            groups = groups,
+            selectedGroupUuid = selectedGroup?.uuid,
+            selectedGroupName = selectedGroup?.name.orEmpty(),
+            selectedGroupColorKey = selectedGroup?.colorKey,
+            selectedGroupStartsInFuture = selectedGroupStartsInFuture,
+            startDate = startDate,
+            endDate = endDate,
+            today = today,
+            remindersEnabled = settingsState.remindersEnabled,
+            firstDayOfWeek = settingsState.firstDayOfWeekOption.resolve(systemLocale()),
+            nextOccurrencesByGroup = buildNextOccurrencesByGroup(
+                groups = groups,
+                entries = entries,
+                start = now,
+                limit = PLAN_BATCH_ADD_UPCOMING_OCCURRENCE_LIMIT
+            ),
+            entriesToAdd = entryPlan.entries,
+            manualEntryCount = entryPlan.entries.count { entry -> entry.sourceGroupUuid == null },
+            skippedEntryCount = entryPlan.skippedEntryCount,
+            deductStock = selection.deductStock,
+            selectedGroupHasTrackedMedicine = selectedGroupHasTrackedMedicine,
+            deductStockAvailability = deductStockAvailability,
+            stockPreviewItems = stockPreviewItems,
+            isSaving = selection.isSaving,
+            isSaved = selection.isSaved,
+            savedEntryCount = selection.savedEntryCount,
+            postLogStockWarning = selection.postLogStockWarning,
+            saveResult = selection.saveResult,
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.Eagerly,
+        initialValue = PlanBatchAddUiState(today = currentDateTime.value.toLocalDate()),
+    )
+
+    init {
+        freezeDefaultRangeWhenSelectable()
+    }
+
+    // selectGroup() leaves the range unset (null) so the combine above derives a
+    // live default. Once the selected group is actually selectable — immediately
+    // for an already-started plan, or when the clock reaches a future plan's
+    // `since` — capture since..today into selectionState so the range stops
+    // tracking the clock and a later rollover can't make it stale or inverted.
+    private fun freezeDefaultRangeWhenSelectable() {
+        viewModelScope.launch {
+            combine(
+                medicationGroupRepository.observeGroups(),
+                selectionState,
+                currentDateTime,
+            ) { groupsOrNull, selection, now ->
+                Triple(groupsOrNull, selection, now.toLocalDate())
+            }.collect { (groupsOrNull, selection, today) ->
+                if (selection.startDate != null || selection.endDate != null) {
+                    return@collect
+                }
+                val selectedGroup = selection.selectedGroupUuid?.let { groupUuid ->
+                    groupsOrNull?.firstOrNull { group -> group.uuid == groupUuid }
+                } ?: return@collect
+                if (!selectedGroup.schedule.since.isAfter(today)) {
+                    selectionState.update { state ->
+                        state.copy(
+                            startDate = selectedGroup.schedule.since,
+                            endDate = today,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun selectGroup(groupUuid: UUID) {
+        if (selectionState.value.isSaving) {
+            return
+        }
+
+        if (selectionState.value.selectedGroupUuid == groupUuid) {
+            clearSelection()
+            return
+        }
+
+        if (uiState.value.groups.none { group -> group.uuid == groupUuid }) {
+            return
+        }
+        // Leave the range unset; freezeDefaultRangeWhenSelectable() captures
+        // since..today once the group is actually selectable. A future-start
+        // group is not yet selectable, so its range stays unset (the UI shows
+        // the prompt) — this avoids freezing a stale `today` that a later
+        // rollover would turn into an inverted range.
+        // Preserve deductStock across group changes — switching the selected
+        // group must not silently flip the user's stock-deduction choice.
+        selectionState.update { state ->
+            state.copy(
+                selectedGroupUuid = groupUuid,
+                startDate = null,
+                endDate = null,
+                isSaved = false,
+                savedEntryCount = null,
+                saveResult = null,
+            )
+        }
+    }
+
+    fun clearSelection() {
+        // Preserve deductStock when the user deselects the group — clearing the
+        // selection must not silently flip the user's stock-deduction choice.
+        selectionState.update { state ->
+            state.copy(
+                selectedGroupUuid = null,
+                startDate = null,
+                endDate = null,
+                isSaved = false,
+                savedEntryCount = null,
+                saveResult = null,
+            )
+        }
+    }
+
+    fun setDeductStock(value: Boolean) {
+        if (selectionState.value.isSaving) return
+        selectionState.update { state -> state.copy(deductStock = value) }
+    }
+
+    fun updateStartDate(date: LocalDate) {
+        selectionState.update { state ->
+            state.copy(
+                startDate = date,
+                endDate = state.endDate?.let { endDate ->
+                    if (date.isAfter(endDate)) date else endDate
+                },
+                isSaved = false,
+                savedEntryCount = null,
+                saveResult = null,
+            )
+        }
+    }
+
+    fun updateEndDate(date: LocalDate) {
+        selectionState.update { state ->
+            state.copy(
+                startDate = state.startDate?.let { startDate ->
+                    if (date.isBefore(startDate)) date else startDate
+                },
+                endDate = date,
+                isSaved = false,
+                savedEntryCount = null,
+                saveResult = null,
+            )
+        }
+    }
+
+    fun saveSelectedRange() {
+        val currentUiState = uiState.value
+        val entriesToSave = currentUiState.entriesToAdd
+        val shouldDeductStock = currentUiState.deductStock
+        val affectedMedicineUuids =
+            entriesToSave.mapNotNull(MedicationLogEntryInput::medicineUuid).toSet()
+        if (entriesToSave.isEmpty() || selectionState.value.isSaving) {
+            return
+        }
+        // A failed save must leave the user's batch intact to retry; the optimistic
+        // update below clears the selection and the toggle, so remember them.
+        val previousSelectedGroupUuid = currentUiState.selectedGroupUuid
+
+        selectionState.update { state ->
+            state.copy(
+                selectedGroupUuid = null,
+                isSaving = true,
+                isSaved = false,
+                savedEntryCount = null,
+                postLogStockWarning = null,
+                saveResult = null,
+                deductStock = false,
+            )
+        }
+
+        viewModelScope.launch {
+            // "Before" baseline from a fresh projection taken just before the
+            // deduction (same as the manual/reminder/widget paths), so the post-save
+            // warning only fires for medicines this batch pushed into a worse tier.
+            val beforeStockStates = if (shouldDeductStock && affectedMedicineUuids.isNotEmpty()) {
+                captureStockStatesForLog(medicineStockRepository, now = Instant.now())
+            } else {
+                emptyMap()
+            }
+            val saveResult = runCatching {
+                // The user already confirmed the batch; entry teardown (back
+                // press racing the 1-frame nav-lock gap) must not tear the
+                // write in half — and reminders must track a write that just
+                // landed, so the reschedule rides the same NonCancellable
+                // block (the finding-4 convention in HistoryViewModel).
+                withContext(NonCancellable) {
+                    medicationLogRepository.saveBackfillEntries(
+                        entries = entriesToSave,
+                        deductStock = shouldDeductStock,
+                    )
+                    runCatching { medicationReminderScheduler.rescheduleAll() }
+                }
+            }.fold(
+                onSuccess = { null },
+                onFailure = { PlanBatchAddSaveResult.FAILURE },
+            )
+            val isSaved = saveResult == null
+            val postLogStockWarning =
+                if (isSaved && shouldDeductStock && affectedMedicineUuids.isNotEmpty()) {
+                    runCatching {
+                        resolvePostLogStockWarning(
+                            projections = medicineStockRepository.projectAllOnce(now = Instant.now()),
+                            affectedMedicineUuids = affectedMedicineUuids,
+                            beforeStatesByUuid = beforeStockStates,
+                        )
+                    }.getOrElse { failure ->
+                        if (failure is CancellationException) throw failure
+                        null
+                    }
+                } else {
+                    null
+                }
+            selectionState.update { state ->
+                if (isSaved) {
+                    state.copy(
+                        selectedGroupUuid = null,
+                        isSaving = false,
+                        isSaved = true,
+                        savedEntryCount = entriesToSave.size,
+                        postLogStockWarning = postLogStockWarning,
+                        saveResult = null,
+                    )
+                } else {
+                    state.copy(
+                        selectedGroupUuid = previousSelectedGroupUuid,
+                        isSaving = false,
+                        isSaved = false,
+                        savedEntryCount = null,
+                        postLogStockWarning = null,
+                        saveResult = saveResult,
+                        deductStock = shouldDeductStock,
+                    )
+                }
+            }
+        }
+    }
+
+    fun consumeSavedState() {
+        selectionState.update { state ->
+            state.copy(isSaved = false, savedEntryCount = null)
+        }
+    }
+
+    fun consumePostLogStockWarning() {
+        selectionState.update { state ->
+            state.copy(postLogStockWarning = null)
+        }
+    }
+
+    fun onSaveResultConsumed() {
+        selectionState.update { state ->
+            state.copy(saveResult = null)
+        }
+    }
+}
+
+data class PlanBatchAddUiState(
+    val isLoading: Boolean = true,
+    val groups: List<MedicationGroup> = emptyList(),
+    val selectedGroupUuid: UUID? = null,
+    val selectedGroupName: String = "",
+    val selectedGroupColorKey: MedicationGroupColorKey? = null,
+    val selectedGroupStartsInFuture: Boolean = false,
+    val startDate: LocalDate = LocalDate.now(),
+    val endDate: LocalDate = LocalDate.now(),
+    val today: LocalDate = LocalDate.now(),
+    val remindersEnabled: Boolean = true,
+    val firstDayOfWeek: DayOfWeek = DayOfWeek.MONDAY,
+    val nextOccurrencesByGroup: Map<UUID, List<LocalDateTime>> = emptyMap(),
+    val entriesToAdd: List<MedicationLogEntryInput> = emptyList(),
+    val manualEntryCount: Int = 0,
+    val skippedEntryCount: Int = 0,
+    val deductStock: Boolean = false,
+    val selectedGroupHasTrackedMedicine: Boolean = false,
+    val deductStockAvailability: DeductStockAvailability = DeductStockAvailability.NO_GROUP,
+    val stockPreviewItems: List<PlanBatchAddStockPreviewItem> = emptyList(),
+    val isSaving: Boolean = false,
+    val isSaved: Boolean = false,
+    val savedEntryCount: Int? = null,
+    // The stock warning raised by the save, if any. Carried in retained UI state
+    // (not a one-shot event) so a config-change race can't drop the snackbar while
+    // the success toast is still suppressed. The screen dispatches it to the
+    // snackbar, suppresses the toast when it is non-null, then consumes it.
+    val postLogStockWarning: PostLogStockWarning? = null,
+    val saveResult: PlanBatchAddSaveResult? = null,
+) {
+    val entryCount: Int
+        get() = entriesToAdd.size
+
+    val canConfirm: Boolean
+        get() = selectedGroupUuid != null && entryCount > 0 && !isSaving
+}
+
+enum class PlanBatchAddSaveResult {
+    FAILURE,
+}
+
+enum class DeductStockAvailability {
+    NO_GROUP,
+    NONE_TRACKED,
+    NOT_STARTED,
+    NO_CHANGES,
+    AVAILABLE,
+}
+
+private data class PlanBatchAddSelectionState(
+    val selectedGroupUuid: UUID? = null,
+    val startDate: LocalDate? = null,
+    val endDate: LocalDate? = null,
+    val isSaving: Boolean = false,
+    val isSaved: Boolean = false,
+    val savedEntryCount: Int? = null,
+    val postLogStockWarning: PostLogStockWarning? = null,
+    val saveResult: PlanBatchAddSaveResult? = null,
+    val deductStock: Boolean = false,
+)
+
+data class PlanBatchAddStockPreviewItem(
+    val medicine: Medicine,
+    val applicationType: MedicationApplicationType,
+    val doseInstruction: DoseInstruction,
+    val medicationCount: Int,
+    // Stock after applying every entry's deduction via the shared deduction
+    // helper. medicine.stock is the "before" value; this is the "after".
+    val afterStock: MedicineStock,
+    // Current (pre-deduction) projection status + runway, shown as info pills.
+    val stockState: MedicineStockState,
+    val runway: RunwayProjection,
+) {
+    val key: String
+        get() = medicine.uuid.toString()
+}
+
+internal fun buildPlanBatchAddStockPreviewItems(
+    entriesToAdd: List<MedicationLogEntryInput>,
+    stockProjections: List<MedicineStockProjection>,
+): List<PlanBatchAddStockPreviewItem> {
+    if (entriesToAdd.isEmpty() || stockProjections.isEmpty()) return emptyList()
+
+    val projectionsByMedicineUuid =
+        stockProjections.associateBy { projection -> projection.medicine.uuid }
+    val afterStockByMedicineUuid = linkedMapOf<UUID, MedicineStock>()
+    // One card per affected tracked medicine. The first contributing entry is the
+    // representative shown on the card; the stock subcard reflects the cumulative
+    // after-stock of every entry for that medicine, so a medicine with several
+    // dose signatures is not rendered as duplicate cards with identical stock.
+    val representativeByMedicineUuid = linkedMapOf<UUID, MedicationLogEntryInput>()
+
+    entriesToAdd.forEach { entry ->
+        val medicineUuid = entry.medicineUuid ?: return@forEach
+        val projection = projectionsByMedicineUuid[medicineUuid] ?: return@forEach
+        val medicine = projection.medicine
+        if (!medicine.stock.trackingEnabled) return@forEach
+        val requestedDose = resolveRequestedDoseForStock(
+            preparation = medicine.preparation,
+            doseInstruction = entry.doseInstruction,
+            count = entry.count.coerceAtLeast(1),
+        ) ?: return@forEach
+        val currentStock = afterStockByMedicineUuid[medicineUuid] ?: medicine.stock
+        afterStockByMedicineUuid[medicineUuid] = deductInsertedDoseStock(
+            preparation = medicine.preparation,
+            stock = currentStock,
+            requestedDose = requestedDose,
+        )
+        representativeByMedicineUuid.putIfAbsent(medicineUuid, entry)
+    }
+
+    return representativeByMedicineUuid.mapNotNull { (medicineUuid, entry) ->
+        val projection = projectionsByMedicineUuid[medicineUuid] ?: return@mapNotNull null
+        val afterStock = afterStockByMedicineUuid[medicineUuid] ?: return@mapNotNull null
+        PlanBatchAddStockPreviewItem(
+            medicine = projection.medicine,
+            applicationType = entry.applicationType,
+            doseInstruction = entry.doseInstruction,
+            medicationCount = entry.count.coerceAtLeast(1),
+            afterStock = afterStock,
+            stockState = projection.state,
+            runway = projection.runway,
+        )
+    }
+}
+
+internal fun buildPlanBatchAddEntries(
+    group: MedicationGroup,
+    existingEntries: List<MedicationLogEntry> = emptyList(),
+    startDate: LocalDate,
+    endDate: LocalDate,
+    now: LocalDateTime = LocalDateTime.now(),
+    zoneId: ZoneId = ZoneId.systemDefault(),
+): List<MedicationLogEntryInput> {
+    return buildPlanBatchAddEntryPlan(
+        group = group,
+        existingEntries = existingEntries,
+        startDate = startDate,
+        endDate = endDate,
+        now = now,
+        zoneId = zoneId,
+    ).entries
+}
+
+internal data class PlanBatchAddEntryPlan(
+    val entries: List<MedicationLogEntryInput> = emptyList(),
+    val skippedEntryCount: Int = 0,
+)
+
+internal fun buildPlanBatchAddEntryPlan(
+    group: MedicationGroup,
+    existingEntries: List<MedicationLogEntry> = emptyList(),
+    startDate: LocalDate,
+    endDate: LocalDate,
+    now: LocalDateTime = LocalDateTime.now(),
+    zoneId: ZoneId = ZoneId.systemDefault(),
+): PlanBatchAddEntryPlan {
+    if (group.medications.isEmpty() || startDate.isAfter(endDate)) {
+        return PlanBatchAddEntryPlan()
+    }
+
+    val fulfilledPlanSlots = existingEntries
+        .asSequence()
+        .filter { entry -> entry.sourceGroupUuid == group.uuid }
+        .mapNotNull(MedicationLogEntry::scheduledFor)
+        .toSet()
+
+    val entries = mutableListOf<MedicationLogEntryInput>()
+    var skippedEntryCount = 0
+
+    buildPlanBatchAddOccurrences(
+        schedule = group.schedule,
+        startDate = startDate,
+        endDate = endDate,
+    ).forEach { occurrence ->
+        if (occurrence.isAfter(now)) {
+            return@forEach
+        }
+        val scheduleTime = group.schedule.timeSlots.firstOrNull { slot ->
+            slot.time == occurrence.toLocalTime()
+        } ?: return@forEach
+        val isBeforePlanStart = occurrence.toLocalDate().isBefore(group.schedule.since)
+        if (!isBeforePlanStart && !group.ownsUnloggedOccurrence(scheduleTime, occurrence)) {
+            return@forEach
+        }
+
+        if (!isBeforePlanStart && occurrence in fulfilledPlanSlots) {
+            skippedEntryCount += group.medications.size
+            return@forEach
+        }
+
+        group.medications.forEach { medication ->
+            entries += MedicationLogEntryInput(
+                medicineUuid = medication.medicineUuid,
+                applicationType = medication.applicationType,
+                doseInstruction = medication.doseInstruction,
+                sourceGroupUuid = if (isBeforePlanStart) null else group.uuid,
+                scheduleTimeUuid = if (isBeforePlanStart) null else scheduleTime.uuid,
+                appliedAt = occurrence.atZone(zoneId).toInstant(),
+                scheduledFor = if (isBeforePlanStart) null else occurrence,
+                count = medication.count,
+                appliedAtTimeZoneId = zoneId.id,
+            )
+        }
+    }
+
+    return PlanBatchAddEntryPlan(
+        entries = entries,
+        skippedEntryCount = skippedEntryCount,
+    )
+}
+
+internal fun buildPlanBatchAddOccurrences(
+    schedule: MedicationGroupSchedule,
+    startDate: LocalDate,
+    endDate: LocalDate,
+): List<LocalDateTime> {
+    if (startDate.isAfter(endDate) || schedule.times.isEmpty()) {
+        return emptyList()
+    }
+
+    val sortedTimes = schedule.times.sorted()
+    val result = mutableListOf<LocalDateTime>()
+    var currentDate = startDate
+    while (!currentDate.isAfter(endDate)) {
+        if (schedule.isScheduledOnForBatchAdd(currentDate)) {
+            sortedTimes.forEach { time ->
+                result += LocalDateTime.of(currentDate, time)
+            }
+        }
+        currentDate = currentDate.plusDays(1)
+    }
+    return result
+}
+
+private fun MedicationGroupSchedule.isScheduledOnForBatchAdd(date: LocalDate): Boolean {
+    val normalizedInterval = interval.coerceAtLeast(1)
+
+    return when (type) {
+        MedicationGroupScheduleType.DAILY ->
+            ChronoUnit.DAYS.between(since, date) % normalizedInterval.toLong() == 0L
+
+        MedicationGroupScheduleType.WEEKLY -> {
+            if (weeklyDaysOfWeek.isEmpty() || date.dayOfWeek !in weeklyDaysOfWeek) {
+                return false
+            }
+            // Mirrors MedicationGroupSchedule.isScheduledOn's since-anchored
+            // cadence. Diverges in that batch-add allows dates before `since`
+            // (for backfill), so the date.isBefore(since) guard is dropped
+            // and we use Math.floorDiv — JVM `/` truncates toward zero, which
+            // for negative deltas would lump dates in the 6 days before
+            // `since` into week 0 and push dates 7–13 days before into
+            // week -1, breaking every-N-weeks parity around the boundary.
+            val weekIndex = Math.floorDiv(ChronoUnit.DAYS.between(since, date), 7L)
+            weekIndex % normalizedInterval.toLong() == 0L
+        }
+    }
+}
+
+private const val PLAN_BATCH_ADD_UPCOMING_OCCURRENCE_LIMIT = 3

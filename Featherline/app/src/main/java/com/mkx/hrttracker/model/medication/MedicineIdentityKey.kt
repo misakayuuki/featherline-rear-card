@@ -1,0 +1,182 @@
+package com.mkx.hrttracker.model.medication
+
+import java.math.BigDecimal
+import java.math.MathContext
+import java.math.RoundingMode
+import java.util.Locale
+
+fun normalizeCustomMedicationName(value: String): String {
+    return value.trim()
+        .replace(Regex("\\s+"), " ")
+        .lowercase(Locale.ROOT)
+}
+
+object MedicineIdentityKey {
+    // Stable identity for the global PATCH_OFF singleton. The medicine
+    // repository looks this up to enforce one-row-per-database semantics.
+    const val PATCH_OFF = "P|PATCH_OFF"
+
+    fun catalog(
+        medicationKey: MedicationKey,
+        preparation: MedicinePreparation,
+    ): String {
+        return buildString {
+            append("C|")
+            append(medicationKey.name)
+            append("|")
+            append(preparation.type.name)
+            appendPreparationFields(preparation)
+        }
+    }
+
+    fun custom(
+        customMedicationName: String,
+        preparation: MedicinePreparation,
+    ): String {
+        return buildString {
+            append("X|")
+            append(normalizeCustomMedicationName(customMedicationName))
+            append("|")
+            append(preparation.type.name)
+            appendPreparationFields(preparation)
+        }
+    }
+
+    fun external(
+        sourceApp: String,
+        applicationType: MedicationApplicationType,
+        compound: String,
+        doseKey: String,
+    ): String {
+        require(sourceApp.isNotBlank())
+        require(compound.isNotBlank())
+        require(doseKey.isNotBlank())
+        return "E|$sourceApp|${applicationType.name}|$compound|$doseKey"
+    }
+
+    fun patchOff(): String = PATCH_OFF
+
+    fun canonicalDouble(value: Double): String {
+        require(value > 0.0 && !value.isNaN() && !value.isInfinite())
+        return BigDecimal.valueOf(value)
+            .setScale(6, RoundingMode.HALF_UP)
+            .stripTrailingZeros()
+            .toPlainString()
+    }
+
+    // Imported identity keys (E|...) round dose magnitudes to 6 significant
+    // figures rather than the 6 decimal places catalog/custom keys use. Source
+    // dose values can carry float-reconstruction noise (e.g. NoMTF dividing an
+    // E2-equivalent by a ratio) and dose magnitudes are small, so significant-
+    // figure rounding collapses that noise without splitting an identity. This
+    // is import-only: catalog/custom keys persisted before this existed were
+    // encoded with canonicalDouble (setScale) and must keep recomputing to the
+    // same string, so they must not be routed through here.
+    fun canonicalImportedDose(value: Double): String {
+        require(value > 0.0 && !value.isNaN() && !value.isInfinite())
+        return BigDecimal.valueOf(value)
+            .round(MathContext(6, RoundingMode.HALF_UP))
+            .stripTrailingZeros()
+            .toPlainString()
+    }
+
+    // The dose-key segment of an imported (E|...) identity key, derived from the
+    // preparation alone. The importer uses this to build a key and the restore /
+    // read boundaries use it to verify a stored key against its preparation, so
+    // the two can never derive the segment differently. The sourceApp and route
+    // segments of an imported key are not recoverable from the entity, so this
+    // is the one component a read boundary can re-check.
+    fun importedDoseKey(preparation: MedicinePreparation): String = when (preparation) {
+        is MedicinePreparation.Pill ->
+            "mg:${canonicalImportedDose(preparation.strengthMgPerTablet)}"
+
+        is MedicinePreparation.ImportedInjection ->
+            "mg:${canonicalImportedDose(preparation.administeredMg)}"
+
+        is MedicinePreparation.ImportedGel ->
+            "mg:${canonicalImportedDose(preparation.appliedEstradiolMg)}"
+
+        is MedicinePreparation.Patch -> when (val specification = preparation.specification) {
+            is MedicinePreparation.PatchSpecification.TotalMg ->
+                "totalmg:${canonicalImportedDose(specification.valueMg)}"
+
+            is MedicinePreparation.PatchSpecification.ReleaseRateMcgPerDay ->
+                "rate:${canonicalImportedDose(specification.valueMcgPerDay)}"
+        }
+
+        is MedicinePreparation.Capsule,
+        is MedicinePreparation.InjectionSingleUseVial,
+        is MedicinePreparation.InjectionMultiUseVial,
+        is MedicinePreparation.GelSachet,
+        is MedicinePreparation.GelContainer,
+        is MedicinePreparation.PatchOff,
+        ->
+            error("Preparation ${preparation::class.simpleName} is not an importable form.")
+    }
+
+    private fun StringBuilder.appendPreparationFields(preparation: MedicinePreparation) {
+        when (preparation) {
+            is MedicinePreparation.Pill -> {
+                appendField("strengthMgPerTablet", preparation.strengthMgPerTablet)
+            }
+
+            is MedicinePreparation.Capsule -> {
+                appendField("strengthMgPerTablet", preparation.strengthMgPerCapsule)
+            }
+
+            is MedicinePreparation.InjectionSingleUseVial -> {
+                appendField("strengthMgPerVial", preparation.strengthMgPerVial)
+            }
+
+            is MedicinePreparation.InjectionMultiUseVial -> {
+                appendField("concentrationMgPerMl", preparation.concentrationMgPerMl)
+                appendField("vialVolumeMl", preparation.vialVolumeMl)
+            }
+
+            is MedicinePreparation.GelSachet -> {
+                appendField("concentrationPercent", preparation.concentrationPercent)
+                appendField("sachetWeightGrams", preparation.sachetWeightGrams)
+            }
+
+            is MedicinePreparation.GelContainer -> {
+                appendField("concentrationPercent", preparation.concentrationPercent)
+                appendField("containerWeightGrams", preparation.containerWeightGrams)
+            }
+
+            is MedicinePreparation.ImportedInjection -> {
+                appendField("administeredMg", preparation.administeredMg)
+                append("|ester=")
+                append(preparation.ester.name)
+            }
+
+            is MedicinePreparation.ImportedGel -> {
+                appendField("appliedEstradiolMg", preparation.appliedEstradiolMg)
+            }
+
+            is MedicinePreparation.Patch -> {
+                when (val specification = preparation.specification) {
+                    is MedicinePreparation.PatchSpecification.TotalMg -> {
+                        appendField("patchTotalMg", specification.valueMg)
+                    }
+
+                    is MedicinePreparation.PatchSpecification.ReleaseRateMcgPerDay -> {
+                        appendField("patchReleaseRateMcgPerDay", specification.valueMcgPerDay)
+                    }
+                }
+            }
+            // The PATCH_OFF singleton always carries the same identity key, so
+            // nothing extra to append after the preparation type marker. (Lives
+            // in catalog/custom helpers' appendPreparationFields purely for
+            // exhaustiveness of the when over MedicinePreparation; the patchOff
+            // helper does not call this path.)
+            is MedicinePreparation.PatchOff -> Unit
+        }
+    }
+
+    private fun StringBuilder.appendField(name: String, value: Double) {
+        append("|")
+        append(name)
+        append("=")
+        append(canonicalDouble(value))
+    }
+}

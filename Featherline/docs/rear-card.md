@@ -14,7 +14,7 @@ First binding uses the explicit Activity action `dev.finall.rearcardbridge.actio
 
 ## Payload schema 1
 
-The ZIP contains `module.json`, `card/index.html`, `card/core.js`, `card/data.js`, and `card/main.js`. The source app writes `window.FEATHERLINE_PAYLOAD = <JSON>;` into `data.js`. Explicit `null` means clear; it must not fall back to an earlier snapshot.
+The ZIP contains `module.json`, `card/index.html`, `card/config.js`, `card/core.js`, `card/data.js`, `card/main.js`, and the static `webroot/` settings page. The source app writes `window.FEATHERLINE_PAYLOAD = <JSON>;` into `data.js`. Explicit `null` means clear; it must not fall back to an earlier snapshot. Every publication includes the complete settings page so health-data updates cannot remove it.
 
 ```json
 {
@@ -62,6 +62,14 @@ At 30 minutes the display marks data as cached. At 24 hours, `validUntil`, a lar
 
 The source's existing HomeWidgetManager requests background refresh every 15 minutes and on data/settings changes. Android scheduling and the rear-screen runtime are inexact. No continuous-refresh guarantee is made.
 
+## Module settings (0.2.0)
+
+Open the module's settings page in rear-card-bridge. `bridge.config` stores `theme` (rose/lavender/mint/blue/amber), `accentColor` and `backgroundColor` (optional hex overrides), `showTrend` (default true), `privacy` (default false), and `cameraInset` (280–450, default 336). Settings writes only these keys and preserves other configuration. The shared `card/config.js` validates values and derives readable colors for both previews and the production card. Configuration remains in the bridge across module updates. The card's saved snapshot includes normalized configuration for synchronous first-frame rendering; asynchronous updates request RAF and refresh the snapshot.
+
+The WebView loads the host-provided `bridge-shim.js` first. Download links use normal HTTPS navigation to GitHub Releases. No package-detection API is available, so a null payload displays installation and synchronization instructions without claiming the source app is absent. Settings previews use synthetic values. After saving configuration, the page writes a configuration-only display snapshot with `payload:null` before requesting refresh. This makes the saved settings available to the next synchronous first frame; the embedded `FEATHERLINE_PAYLOAD` remains authoritative for health data, including an explicit null when sharing is disabled. Snapshot failures are reported separately and can be retried. Privacy hides displayed health details; it is not deletion of the bridge's stored copy.
+
+Upgrade by installing the new debug APK over the previous adaptation and choosing **立即同步** in the app. The 0.2.0 module uses versionCode 2; its matching debug APK also uses versionCode 2 and an adaptation-specific version name. The signing identity and package ID are unchanged.
+
 ## Building and checking
 
 Use the upstream Android toolchain: Gradle wrapper 9.4.1, AGP 9.2.1, SDK 37, and a Java 17-compatible toolchain (Gradle can run on JDK 21). Set your SDK path in local.properties. Windows paths with non-ASCII characters use the included `android.overridePathCheck=true` flag.
@@ -87,7 +95,7 @@ For module changes, place a checkout of rear-card-bridge at `../upstream/rear-ca
 
 ```text
 node build-module.mjs
-node --test tests/core.test.cjs tests/renderer.test.cjs
+node --test tests/*.test.cjs
 ```
 
 Compiled module resources are included with the Android project so APK builds work independently of the JavaScript toolchain. Node tests cover interpolation, true zero, unit labels, stale/expired data, midnight, countdowns, privacy, async-config races, snapshot clearing, RAF-only drawing, and hot reload. Android tests cover scheduling across days and DST, fulfilled/partial/outside-window records, archived plans, all source concentration units, and invalid/overflowing projections.

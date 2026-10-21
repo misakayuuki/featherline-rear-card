@@ -1,0 +1,256 @@
+package com.mkx.hrttracker.ui.plan
+
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberTopAppBarState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.mkx.hrttracker.R
+import com.mkx.hrttracker.model.medication.MedicationGroup
+import com.mkx.hrttracker.ui.components.AppContentContainer
+import com.mkx.hrttracker.ui.components.HazeTopAppBar
+import com.mkx.hrttracker.ui.components.HrtSectionHeader
+import com.mkx.hrttracker.ui.components.SupportMessageListItem
+import com.mkx.hrttracker.ui.components.appContentPaddingValuesBehindTopAppBar
+import com.mkx.hrttracker.ui.components.hrtSection
+import com.mkx.hrttracker.ui.components.paddingBehindTopAppBar
+import com.mkx.hrttracker.ui.components.pinnedTopAppBarScrollBehavior
+import com.mkx.hrttracker.ui.components.topAppBarScrollToTop
+import com.mkx.hrttracker.ui.theme.HrtTrackerTheme
+import com.mkx.hrttracker.util.dateLabelFormatter
+import com.mkx.hrttracker.util.rememberAppLocale
+import com.mkx.hrttracker.util.rememberLocalizedShortTimeFormatter
+import java.time.DayOfWeek
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import java.util.UUID
+
+@Composable
+fun ArchivedMedicationGroupsScreen(
+    onNavigateBack: () -> Unit,
+    onGroupClick: (UUID) -> Unit,
+    modifier: Modifier = Modifier,
+    viewModel: ArchivedMedicationGroupsViewModel = hiltViewModel(),
+) {
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+
+    ArchivedMedicationGroupsScreenContent(
+        uiState = uiState,
+        onNavigateBack = onNavigateBack,
+        onGroupClick = onGroupClick,
+        modifier = modifier,
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ArchivedMedicationGroupsScreenContent(
+    uiState: ArchivedMedicationGroupsUiState,
+    onNavigateBack: () -> Unit,
+    onGroupClick: (UUID) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val appLocale = rememberAppLocale()
+    val listState = rememberLazyListState()
+    val topAppBarState = rememberTopAppBarState()
+    val scrollBehavior = pinnedTopAppBarScrollBehavior(
+        lazyListState = listState,
+        state = topAppBarState
+    )
+    val dateFormatter = remember(appLocale, uiState.today) {
+        dateLabelFormatter(appLocale, uiState.today)
+    }
+    val timeFormatter = rememberLocalizedShortTimeFormatter(appLocale)
+
+    Scaffold(
+        modifier = modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        topBar = {
+            HazeTopAppBar(
+                modifier = Modifier.topAppBarScrollToTop(scrollBehavior, listState),
+                title = {
+                    val title = stringResource(R.string.plan_archived_groups)
+                    Text(
+                        text = title,
+                    )
+                },
+                navigationIcon = {
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                            contentDescription = stringResource(R.string.navigate_back)
+                        )
+                    }
+                },
+                scrollBehavior = scrollBehavior,
+            )
+        }
+    ) { innerPadding ->
+        AppContentContainer(modifier = Modifier.paddingBehindTopAppBar(innerPadding)) {
+            if (uiState.isLoading) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    LoadingIndicator()
+                }
+                return@AppContentContainer
+            }
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = appContentPaddingValuesBehindTopAppBar(innerPadding),
+            ) {
+                hrtSection(
+                    key = "archived-groups",
+                    header = {
+                        HrtSectionHeader(
+                            text = stringResource(R.string.plan_archived_groups),
+                            topPadding = false,
+                        )
+                    },
+                ) {
+                    if (uiState.groups.isEmpty()) {
+                        item("archived-groups-empty") {
+                            SupportMessageListItem(
+                                text = stringResource(R.string.plan_archived_groups_empty),
+                                painter = painterResource(R.drawable.ic_info),
+                            )
+                        }
+                    } else {
+                        uiState.groups.forEach { group ->
+                            item("archived-group-${group.uuid}") {
+                                ArchivedMedicationGroupCard(
+                                    group = group,
+                                    appLocale = appLocale,
+                                    dateFormatter = dateFormatter,
+                                    timeFormatter = timeFormatter,
+                                    today = uiState.today,
+                                    firstDayOfWeek = uiState.firstDayOfWeek,
+                                    onClick = { onGroupClick(group.uuid) },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArchivedMedicationGroupCard(
+    group: MedicationGroup,
+    appLocale: Locale,
+    dateFormatter: (LocalDate) -> String,
+    timeFormatter: DateTimeFormatter,
+    today: LocalDate,
+    firstDayOfWeek: DayOfWeek,
+    onClick: () -> Unit,
+    index: Int? = null,
+    itemCount: Int? = null,
+) {
+    val zoneId = remember { ZoneId.systemDefault() }
+    val createdDate = remember(group.createdAt, zoneId) {
+        group.createdAt.atZone(zoneId).toLocalDate()
+    }
+    val archivedDate = remember(group.archivedAt, zoneId) {
+        group.archivedAt?.atZone(zoneId)?.toLocalDate()
+    }
+    val createdText = stringResource(
+        R.string.plan_archived_groups_created_at,
+        dateFormatter(createdDate),
+    )
+    val archivedText = archivedDate?.let { date ->
+        stringResource(
+            R.string.plan_archived_groups_archived_at,
+            dateFormatter(date),
+        )
+    }
+    val archivePainter = painterResource(R.drawable.ic_archive)
+    val eventPainter = painterResource(R.drawable.ic_event)
+    val metadataRows = remember(createdText, archivedText, archivePainter, eventPainter) {
+        buildList {
+            add(
+                RegimenGroupCardMetadata(
+                    text = createdText,
+                    iconPainter = eventPainter,
+                )
+            )
+            if (archivedText != null) {
+                add(
+                    RegimenGroupCardMetadata(
+                        text = archivedText,
+                        iconPainter = archivePainter,
+                    )
+                )
+            }
+        }
+    }
+
+    RegimenGroupCard(
+        group = group,
+        remindersEnabled = false,
+        hasNotificationAccess = true,
+        appLocale = appLocale,
+        dateFormatter = dateFormatter,
+        timeFormatter = timeFormatter,
+        upcomingOccurrences = emptyList(),
+        today = today,
+        onClick = onClick,
+        index = index,
+        itemCount = itemCount,
+        showNotificationIcon = false,
+        showUpcomingSection = false,
+        showStartDate = false,
+        firstDayOfWeek = firstDayOfWeek,
+        metadataRows = metadataRows,
+    )
+}
+
+@Preview(showBackground = true, widthDp = 420, heightDp = 900)
+@Composable
+private fun ArchivedMedicationGroupsScreenPreview() {
+    val today = LocalDate.now()
+    val zoneId = ZoneId.systemDefault()
+    val groups = buildPlanPreviewUiState().medicationGroups.map { group ->
+        group.copy(
+            createdAt = today.minusMonths(2).atTime(LocalTime.NOON).atZone(zoneId).toInstant(),
+            archivedAt = today.minusDays(3).atTime(LocalTime.NOON).atZone(zoneId).toInstant(),
+        )
+    }
+
+    HrtTrackerTheme(dynamicColor = false) {
+        ArchivedMedicationGroupsScreenContent(
+            uiState = ArchivedMedicationGroupsUiState(
+                isLoading = false,
+                today = today,
+                groups = groups,
+            ),
+            onNavigateBack = { },
+            onGroupClick = { },
+        )
+    }
+}

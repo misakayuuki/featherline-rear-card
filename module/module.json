@@ -1,8 +1,8 @@
 {
   "id": "dev.featherline.rearcard",
   "name": "Featherline · 浓度与用药日程",
-  "version": "0.1.0",
-  "versionCode": 1,
+  "version": "0.2.0",
+  "versionCode": 2,
   "apiVersion": 2,
   "description": "由 Featherline 背屏适配版主动同步：雌二醇模型估算、下次计划用药倒计时和今日进度。",
   "author": "Featherline Rear Card Community",

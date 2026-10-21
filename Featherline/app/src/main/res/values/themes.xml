@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.HrtTracker" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+
+    <style name="Theme.HrtTracker.WidgetConfig" parent="Theme.HrtTracker">
+        <!-- Full-screen opaque activity over the wallpaper: windowShowWallpaper puts the
+             wallpaper behind the window and the transparent windowBackground lets it show
+             through the screen's punched-out wallpaper window. windowIsTranslucent is
+             deliberately absent: the old translucent window had no backdrop behind the
+             nav-bar region in the launcher's reconfigure task, rendering a black bar on
+             API < 35. -->
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowShowWallpaper">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>

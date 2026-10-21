@@ -99,7 +99,7 @@ android {
     buildTypes {
         debug {
             applicationIdSuffix = ".debug"
-            versionNameSuffix = "-$gitCommitHash"
+            versionNameSuffix = "-rearcard0.2.0-$gitCommitHash"
             signingConfig = signingConfigs.getByName("debug")
         }
 
@@ -188,6 +188,8 @@ room {
 androidComponents {
     onVariants(selector().all()) { variant ->
         variant.outputs.forEach { output ->
+            // Distribution version for this debug fork; release keeps upstream Git versions.
+            if (variant.buildType == "debug") output.versionCode.set(2)
             val flavor = variant.productFlavors
                 .find { it.first == "distribution" }
                 ?.second ?: "universal"

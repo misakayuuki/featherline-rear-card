@@ -1,0 +1,52 @@
+package com.mkx.hrttracker.ui.journal
+
+import com.mkx.hrttracker.model.journal.MilestoneUnit
+import com.mkx.hrttracker.model.journal.Milestones
+import com.mkx.hrttracker.model.journal.TrackedDate
+import com.mkx.hrttracker.model.journal.dayCount
+import java.time.LocalDate
+
+data class TimelineNodeUiState(
+    val anchor: AnchorRowUiState,
+    val isPinned: Boolean,
+)
+
+// One-shot tracked-date mutation failure. SAVE covers add/update/pin/reorder/background; DELETE
+// covers deleteDate — all the copy distinguishes.
+enum class MilestoneMutation { SAVE, DELETE }
+
+data class MilestonesUiState(
+    val isLoading: Boolean = true,
+    val today: LocalDate = LocalDate.now(),
+    val hero: AnchorRowUiState? = null,
+    val heroNextMilestone: NextMilestoneUiState? = null,
+    val pinnedTray: List<AnchorRowUiState> = emptyList(),
+    // The flat tracked-date list (post-pending-edits, sorted) the timeline is built from.
+    // Surfaced for the pin-folder selector and AnchorShortcutManager.pin, which need full
+    // TrackedDates (icon/palette/date), not the AnchorRowUiState the timeline carries.
+    val anchors: List<TrackedDate> = emptyList(),
+    val timeline: List<TimelineNodeUiState> = emptyList(),
+    val todayDividerIndex: Int = 0,
+    val isEditMode: Boolean = false,
+    val dateMutationError: MilestoneMutation? = null,
+)
+
+data class NextMilestoneUiState(
+    val remainingDays: Long,
+    val value: Long,
+    val unit: MilestoneUnit,
+)
+
+// The next (or just-reached) milestone for the hero anchor, used by both the Milestones page
+// and the top-level Journal page hero card. Returns null when the anchor has no upcoming or
+// current milestone.
+fun nextMilestoneUiState(anchorDate: LocalDate, today: LocalDate): NextMilestoneUiState? {
+    val currentDayCount = dayCount(anchorDate, today)
+    return (Milestones.current(anchorDate, today) ?: Milestones.next(anchorDate, today))?.let { milestone ->
+        NextMilestoneUiState(
+            remainingDays = milestone.dayCount - currentDayCount.magnitude,
+            value = milestone.value,
+            unit = milestone.unit,
+        )
+    }
+}

@@ -27,7 +27,10 @@ function sample() {
   };
 }
 
-function render(name, payload, privacy = false) {
+// Keep the original boolean privacy argument working; themed previews pass a preference object.
+function render(name, payload, preferences = false) {
+  const settings = typeof preferences === 'boolean' ? { privacy: preferences } : preferences;
+  const config = require('../module/card/config.js').normalize(settings);
   const canvas = createCanvas(912, 596), ctx = canvas.getContext('2d'), frames = [];
   const textBounds = [];
   const originalFillText = ctx.fillText.bind(ctx);
@@ -47,11 +50,11 @@ function render(name, payload, privacy = false) {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
-  for (const file of ['core.js', 'main.js']) vm.runInContext(fs.readFileSync(path.join(project, 'module/card', file), 'utf8'), sandbox);
-  if (privacy) sandbox.FeatherlineCardPreview.update(payload, { privacy: true, cameraInset: 336 });
+  for (const file of ['config.js', 'core.js', 'main.js']) vm.runInContext(fs.readFileSync(path.join(project, 'module/card', file), 'utf8'), sandbox);
+  sandbox.FeatherlineCardPreview.update(payload, config);
   while (frames.length) frames.shift()();
   for (const bounds of textBounds) {
-    assert.ok(bounds.left >= 336 && bounds.right <= 912, 'text exceeds horizontal safe bounds: ' + bounds.text);
+    assert.ok(bounds.left >= config.cameraInset && bounds.right <= 912, 'text exceeds horizontal safe bounds: ' + bounds.text);
     assert.ok(bounds.top >= 0 && bounds.bottom <= 596, 'text exceeds vertical bounds: ' + bounds.text);
   }
   // These marks occupy the camera reserve only; the right-hand UI above is the actual module.
@@ -76,3 +79,5 @@ function render(name, payload, privacy = false) {
 render('structured-card', sample());
 render('structured-card-privacy', sample(), true);
 render('structured-card-empty', null);
+render('structured-card-blue', sample(), { theme: 'blue' });
+render('structured-card-light', sample(), { theme: 'blue', backgroundColor: '#f8fafc', accentColor: '#005fb8', cameraInset: 450 });

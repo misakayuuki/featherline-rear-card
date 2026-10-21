@@ -8,19 +8,20 @@
   var stopped = false;
   var queued = false;
   var frame = null;
-  var config = { cameraInset: 336, privacy: false };
+  var preferences = window.FeatherlineConfig;
+  var config = preferences.normalize();
   var configGeneration = 0;
   var bridgeApi = typeof bridge === 'undefined' ? null : bridge;
   var stored = null;
   if (bridgeApi && bridgeApi.card && bridgeApi.card.readSnapshot) {
     try { stored = bridgeApi.card.readSnapshot(); } catch (_) { stored = null; }
   }
-  if (stored && stored.schema === 1 && stored.config) config = stored.config;
+  if (stored && stored.schema === 1 && stored.config) config = preferences.normalize(stored.config);
   // New embedded data is authoritative, including null when the user stops sharing.
   var payload = Object.prototype.hasOwnProperty.call(window, 'FEATHERLINE_PAYLOAD')
     ? window.FEATHERLINE_PAYLOAD
     : stored && stored.schema === 1 ? stored.payload : null;
-  var colors = { bg: '#111015', panel: '#211d26', line: '#39303e', pink: '#f2bcce', white: '#f9edf3', soft: '#bdadb9', dim: '#877b88', green: '#b1d6be' };
+  var colors = preferences.palette(config);
 
   function rounded(x, y, w, h, radius) {
     var r = Math.min(radius, w / 2, h / 2);
@@ -53,6 +54,7 @@
     });
   }
   function draw() {
+    colors = preferences.palette(config);
     var model = window.FeatherlineCore.view(payload, Date.now(), config);
     var inset = Math.max(280, Math.min(450, Number(config.cameraInset) || 336));
     var left = inset + 24;
@@ -78,20 +80,23 @@
     text('E2', right, 50, 17, colors.soft, 90, '500', 'right');
 
     if (!model.connected) {
-      text('还没有连接数据', left, 178, 34, colors.white, width, '500');
-      text('雌二醇估算浓度', left, 234, 22, colors.soft, width);
-      text('—', left, 298, 74, colors.dim, width);
-      ctx.fillStyle = colors.panel; rounded(left, 382, width, 112, 23); ctx.fill();
-      text('下一次用药', left + 23, 412, 20, colors.soft, width - 46);
-      text('等待 Featherline 数据', left + 23, 456, 27, colors.white, width - 46);
-      text('请在 Featherline 设置中开启背屏同步', left, 553, 18, colors.dim, width);
+      text('还没有连接数据', left, 165, 34, colors.white, width, '500');
+      text('雌二醇估算 · 用药日程', left, 213, 21, colors.soft, width);
+      ctx.fillStyle = colors.panel; rounded(left, 266, width, 180, 23); ctx.fill();
+      text('未安装？先下载背屏适配版', left + 23, 301, 24, colors.white, width - 46, '500');
+      text('github.com/misakayuuki/', left + 23, 350, 22, colors.pink, width - 46);
+      text('featherline-rear-card', left + 23, 383, 22, colors.pink, width - 46);
+      text('在模块设置页可点击下载', left + 23, 421, 17, colors.dim, width - 46);
+      text('已安装？在 App 设置 → 外观', left, 497, 21, colors.soft, width);
+      text('打开 Featherline 背屏，开启同步并绑定', left, 532, 18, colors.soft, width);
+      text('尚未收到数据不代表 App 未安装', left, 567, 16, colors.dim, width);
       ctx.restore();
       return;
     }
 
     text('雌二醇', left, 118, 23, colors.soft, width - 155);
-    ctx.fillStyle = '#352731'; rounded(right - 130, 101, 130, 33, 16); ctx.fill();
-    text('模型估算', right - 65, 118, 17, colors.pink, 110, '400', 'center');
+    ctx.fillStyle = colors.badge; rounded(right - 130, 101, 130, 33, 16); ctx.fill();
+    text('模型估算', right - 65, 118, 17, colors.badgeText, 110, '400', 'center');
     var estimate = model.estimateText || '—';
     var estimateSize = 110;
     ctx.font = '400 ' + estimateSize + 'px sans-serif';
@@ -103,7 +108,7 @@
     text(model.unitLabel, right, 228, 24, colors.pink, 115, '400', 'right');
     text(model.estimateNote || '模型估算 · 非实测', left, 276, 18, colors.dim, width);
 
-    var points = config.privacy ? [] : model.points || [];
+    var points = config.privacy || !config.showTrend ? [] : model.points || [];
     if (points.length > 1) {
       ctx.strokeStyle = colors.line;
       ctx.lineWidth = 1;
@@ -129,9 +134,9 @@
     text(model.nextLabel, left + 22, 466, 16, colors.dim, width - 44);
     text(model.progressText, left, 519, 20, colors.soft, width);
     var foot = model.pendingText || model.freshnessText;
-    ctx.fillStyle = model.stale ? '#dfba82' : colors.green;
+    ctx.fillStyle = model.stale ? colors.warning : colors.green;
     ctx.beginPath(); ctx.arc(left + 4, 559, 3.5, 0, Math.PI * 2); ctx.fill();
-    text(foot, left + 17, 559, 17, model.stale ? '#dfba82' : colors.dim, width - 17);
+    text(foot, left + 17, 559, 17, model.stale ? colors.warning : colors.dim, width - 17);
     ctx.restore();
   }
 
@@ -146,7 +151,7 @@
     update: function (nextPayload, nextConfig) {
       if (stopped) return;
       payload = nextPayload;
-      if (nextConfig) config = nextConfig;
+      if (nextConfig) config = preferences.normalize(nextConfig);
       requestDraw();
     }
   };
@@ -160,14 +165,14 @@
     try {
       var value = await bridgeApi.config.get();
       if (stopped || ticket !== configGeneration) return;
-      config = value || {cameraInset:336,privacy:false};
+      config = preferences.normalize(value);
       requestDraw(); await persist();
     } catch (_) { if (!stopped) await persist(); }
   }
   function configChanged(value) {
     if (stopped) return;
     configGeneration++;
-    config = value || {cameraInset:336,privacy:false}; requestDraw(); persist();
+    config = preferences.normalize(value); requestDraw(); persist();
   }
   requestDraw();
   persist();

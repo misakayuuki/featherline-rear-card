@@ -1,8 +1,8 @@
 dist/
 node_modules/
 .cache/
-android/
-src/
+/android/
+/src/
 **/.gradle/
 **/.kotlin/
 **/build/

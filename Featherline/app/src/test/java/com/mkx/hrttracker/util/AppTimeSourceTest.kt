@@ -1,0 +1,574 @@
+package com.mkx.hrttracker.util
+
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Test
+import java.time.Clock
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.ZoneOffset
+import java.util.TimeZone
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class AppTimeSourceTest {
+    @Test
+    fun defaultAppTimeSource_nowReturnsUntruncatedClockInstant() = runTest {
+        val instant = Instant.parse("2026-04-25T12:00:43.500Z")
+        val source = DefaultAppTimeSource(
+            clock = Clock.fixed(instant, ZoneOffset.UTC),
+            appScope = backgroundScope,
+        )
+
+        assertEquals(instant, source.now())
+    }
+
+    @Test
+    fun appTimeSnapshotTicker_emitsImmediateSnapshotThenMinuteBoundaries() = runTest {
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            val utcZone = ZoneId.of("UTC")
+            val clock = SchedulerClock(
+                scheduler = testScheduler,
+                baseInstant = Instant.parse("2026-04-25T12:00:43.500Z"),
+                zone = ZoneOffset.UTC
+            )
+            val emissions = mutableListOf<AppTimeSnapshot>()
+
+            val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+                appTimeSnapshotTicker(clock)
+                    .take(3)
+                    .toList(emissions)
+            }
+
+            assertEquals(
+                listOf(AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 0), utcZone)),
+                emissions
+            )
+
+            advanceTimeBy(16_499)
+            runCurrent()
+            assertEquals(1, emissions.size)
+
+            advanceTimeBy(1)
+            runCurrent()
+            assertEquals(
+                listOf(
+                    AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 0), utcZone),
+                    AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 1), utcZone),
+                ),
+                emissions
+            )
+
+            advanceTimeBy(60_000)
+            runCurrent()
+            assertEquals(
+                listOf(
+                    AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 0), utcZone),
+                    AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 1), utcZone),
+                    AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 2), utcZone),
+                ),
+                emissions
+            )
+
+            job.cancel()
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun appTimeSnapshotTicker_emitsMinuteSnapshotsWithoutSyntheticGeneration() = runTest {
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            val utcZone = ZoneId.of("UTC")
+            val clock = SchedulerClock(
+                scheduler = testScheduler,
+                baseInstant = Instant.parse("2026-04-25T12:00:43.500Z"),
+                zone = ZoneOffset.UTC
+            )
+            val emissions = mutableListOf<AppTimeSnapshot>()
+
+            val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+                appTimeSnapshotTicker(clock)
+                    .take(2)
+                    .toList(emissions)
+            }
+
+            advanceTimeBy(16_500)
+            runCurrent()
+
+            assertEquals(
+                listOf(
+                    AppTimeSnapshot(
+                        minute = LocalDateTime.of(2026, 4, 25, 12, 0),
+                        zone = utcZone,
+                    ),
+                    AppTimeSnapshot(
+                        minute = LocalDateTime.of(2026, 4, 25, 12, 1),
+                        zone = utcZone,
+                    ),
+                ),
+                emissions,
+            )
+
+            job.cancel()
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun refresh_reReadsZoneAndMinuteForActiveSnapshotSubscribers() = runTest {
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            val tokyoZone = ZoneId.of("Asia/Tokyo")
+            val clock = MutableInstantClock(
+                instant = Instant.parse("2026-04-25T12:00:30Z"),
+                zone = ZoneOffset.UTC,
+            )
+            val source = DefaultAppTimeSource(clock = clock, appScope = backgroundScope)
+            val emissions = mutableListOf<AppTimeSnapshot>()
+
+            val collector = launch { source.currentSnapshot.collect { emissions += it } }
+            runCurrent()
+            assertEquals(
+                AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 0), ZoneId.of("UTC")),
+                emissions.last(),
+            )
+
+            TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tokyo"))
+            source.refresh()
+            runCurrent()
+
+            val expectedSnapshot = AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 21, 0), tokyoZone)
+            assertEquals(expectedSnapshot, emissions.last())
+            assertEquals(expectedSnapshot, source.currentSnapshot.value)
+            assertEquals(expectedSnapshot.minute, source.currentMinute.value)
+            assertEquals(expectedSnapshot.zone, source.currentZone.value)
+
+            collector.cancel()
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun refresh_reEmitsOnlyWhenSnapshotValueChanges() = runTest {
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            val clock = MutableInstantClock(
+                instant = Instant.parse("2026-04-25T12:00:30Z"),
+                zone = ZoneOffset.UTC,
+            )
+            val source = DefaultAppTimeSource(clock = clock, appScope = backgroundScope)
+            val emissions = mutableListOf<AppTimeSnapshot>()
+
+            val collector = launch(UnconfinedTestDispatcher(testScheduler)) {
+                source.currentSnapshot
+                    .take(2)
+                    .toList(emissions)
+            }
+            runCurrent()
+            assertEquals(
+                listOf(AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 0), ZoneId.of("UTC"))),
+                emissions,
+            )
+
+            source.refresh()
+            runCurrent()
+            assertEquals(
+                listOf(AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 0), ZoneId.of("UTC"))),
+                emissions,
+            )
+
+            clock.instant = Instant.parse("2026-04-25T13:30:30Z")
+            source.refresh()
+            runCurrent()
+
+            assertEquals(
+                listOf(
+                    AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 0), ZoneId.of("UTC")),
+                    AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 13, 30), ZoneId.of("UTC")),
+                ),
+                emissions,
+            )
+
+            collector.cancel()
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun refresh_reReadsWallClockForActiveSubscribers() = runTest {
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            // A clock whose wall time is set independently of the test
+            // scheduler, so we can advance virtual time (driving delay /
+            // WhileSubscribed) without moving the wall clock, and vice versa.
+            val clock = MutableInstantClock(
+                instant = Instant.parse("2026-04-25T12:00:30Z"),
+                zone = ZoneOffset.UTC,
+            )
+            val source = DefaultAppTimeSource(clock = clock, appScope = backgroundScope)
+
+            // Keep the StateFlow hot for the whole scenario — this mirrors a
+            // warm/frozen process whose WhileSubscribed window never elapsed
+            // across a brief backgrounding.
+            val minutes = mutableListOf<LocalDateTime>()
+            val collector = launch { source.currentMinute.collect { minutes += it } }
+            runCurrent()
+            assertEquals(LocalDateTime.of(2026, 4, 25, 12, 0), minutes.last())
+
+            // The wall clock jumps forward while the app is backgrounded (user
+            // changes date/time, or a midnight crossing). The monotonic
+            // minute-ticker delay has NOT yet reached the next boundary, so the
+            // subscriber's minute is stale: without a forced refresh the home
+            // screens would keep showing the old time until the next tick.
+            clock.instant = Instant.parse("2026-04-25T13:30:30Z")
+            advanceTimeBy(2_000)
+            runCurrent()
+            assertEquals(LocalDateTime.of(2026, 4, 25, 12, 0), minutes.last())
+
+            // Foregrounding nudges the source to re-read the wall clock
+            // immediately, without waiting up to a minute for the next tick.
+            source.refresh()
+            runCurrent()
+            assertEquals(LocalDateTime.of(2026, 4, 25, 13, 30), minutes.last())
+
+            collector.cancel()
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun refresh_realignsTickerToNewWallClockBoundary() = runTest {
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            val clock = MutableInstantClock(
+                instant = Instant.parse("2026-04-25T12:00:00Z"),
+                zone = ZoneOffset.UTC,
+            )
+            val source = DefaultAppTimeSource(clock = clock, appScope = backgroundScope)
+
+            val minutes = mutableListOf<LocalDateTime>()
+            val collector = launch { source.currentMinute.collect { minutes += it } }
+            runCurrent()
+            // Ticker emitted 12:00 and is now sleeping until the 12:01 boundary,
+            // i.e. for a full 60s of monotonic time.
+            assertEquals(LocalDateTime.of(2026, 4, 25, 12, 0), minutes.last())
+
+            // 1s into that sleep the app backgrounds; the wall clock is moved to
+            // 13:30:59 and the app is foregrounded -> refresh().
+            advanceTimeBy(1_000)
+            clock.instant = Instant.parse("2026-04-25T13:30:59Z")
+            source.refresh()
+            runCurrent()
+            assertEquals(LocalDateTime.of(2026, 4, 25, 13, 30), minutes.last())
+
+            // 1 real second later the wall clock crosses 13:31:00. The minute
+            // label must advance promptly, NOT wait out the original ~59s sleep
+            // that was scheduled against the pre-jump clock.
+            advanceTimeBy(1_000)
+            clock.instant = Instant.parse("2026-04-25T13:31:00Z")
+            runCurrent()
+            assertEquals(LocalDateTime.of(2026, 4, 25, 13, 31), minutes.last())
+
+            collector.cancel()
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun currentMinuteProjection_doesNotKeepSnapshotTickerActiveAfterCancellation() = runTest {
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            val clock = MutableInstantClock(
+                instant = Instant.parse("2026-04-25T12:00:00Z"),
+                zone = ZoneOffset.UTC,
+            )
+            val source = DefaultAppTimeSource(
+                clock = clock,
+                appScope = backgroundScope,
+                stopTimeoutMillis = 0L,
+            )
+
+            val collector = launch { source.currentMinute.collect {} }
+            runCurrent()
+            assertEquals(LocalDateTime.of(2026, 4, 25, 12, 0), source.currentMinute.value)
+
+            collector.cancel()
+            runCurrent()
+            // A running ticker would read the clock at the next boundary.
+            val readsAfterCancel = clock.reads
+            advanceTimeBy(120_000)
+            runCurrent()
+
+            assertEquals(readsAfterCancel, clock.reads)
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun resubscribe_afterTickerStopped_seesFreshMinuteNotStaleOne() = runTest {
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            val clock = MutableInstantClock(
+                instant = Instant.parse("2026-04-25T20:15:30Z"),
+                zone = ZoneOffset.UTC,
+            )
+            val source = DefaultAppTimeSource(
+                clock = clock,
+                appScope = backgroundScope,
+                stopTimeoutMillis = 5_000L,
+            )
+            val stale = AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 20, 15), ZoneId.of("UTC"))
+            val fresh = AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 20, 16), ZoneId.of("UTC"))
+
+            val first = mutableListOf<AppTimeSnapshot>()
+            val firstJob = launch { source.currentSnapshot.collect { first += it } }
+            runCurrent()
+            assertEquals(listOf(stale), first)
+
+            // App backgrounds: the ticker stops after the stop timeout, and
+            // the wall clock moves on without it.
+            firstJob.cancel()
+            advanceTimeBy(5_001)
+            runCurrent()
+            clock.instant = Instant.parse("2026-04-25T20:16:01Z")
+
+            assertEquals(fresh, source.currentSnapshot.value)
+
+            val second = mutableListOf<AppTimeSnapshot>()
+            val secondJob = launch(UnconfinedTestDispatcher(testScheduler)) {
+                source.currentSnapshot.collect { second += it }
+            }
+            runCurrent()
+            assertEquals(listOf(fresh), second)
+
+            val gated = source.currentSnapshot
+                .tickWhileSubscribed(MutableStateFlow(1)) { it.minute.toLocalDate() }
+            assertEquals(fresh, gated.value)
+            val gatedEmissions = mutableListOf<AppTimeSnapshot>()
+            val gatedJob = launch(UnconfinedTestDispatcher(testScheduler)) {
+                gated.collect { gatedEmissions += it }
+            }
+            runCurrent()
+            assertEquals(listOf(fresh), gatedEmissions)
+
+            secondJob.cancel()
+            gatedJob.cancel()
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun currentAppTimeSnapshot_readsInstantAndZoneAsOneValue() {
+        val originalTimeZone = TimeZone.getDefault()
+        val clock = Clock.fixed(
+            Instant.parse("2026-04-25T12:00:00Z"),
+            ZoneOffset.UTC
+        )
+
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+            assertEquals(
+                AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 12, 0), ZoneId.of("UTC")),
+                currentAppTimeSnapshot(clock),
+            )
+            assertEquals(LocalDateTime.of(2026, 4, 25, 12, 0), currentMinute(clock))
+
+            TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tokyo"))
+            assertEquals(
+                AppTimeSnapshot(LocalDateTime.of(2026, 4, 25, 21, 0), ZoneId.of("Asia/Tokyo")),
+                currentAppTimeSnapshot(clock),
+            )
+            assertEquals(LocalDateTime.of(2026, 4, 25, 21, 0), currentMinute(clock))
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
+        }
+    }
+
+    @Test
+    fun millisUntilNextMinuteBoundary_usesStrictlyFutureBoundaryAtExactMinute() {
+        val clock = Clock.fixed(
+            Instant.parse("2026-04-25T12:00:00Z"),
+            ZoneOffset.UTC
+        )
+
+        assertEquals(60_000L, millisUntilNextMinuteBoundary(clock))
+    }
+
+    @Test
+    fun tickWhileSubscribed_suppressesSameKeyTicksWhileUnsubscribed() = runTest {
+        val utcZone = ZoneId.of("UTC")
+        val source = MutableStateFlow(
+            AppTimeSnapshot(LocalDateTime.of(2026, 6, 11, 12, 0), utcZone)
+        )
+        val subscriptions = MutableStateFlow(0)
+        val gated = source.tickWhileSubscribed(subscriptions) { it.minute.toLocalDate() to it.zone }
+        val emissions = mutableListOf<AppTimeSnapshot>()
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            gated.collect { emissions += it }
+        }
+        runCurrent()
+        assertEquals(1, emissions.size)
+
+        // A minute tick with the same date/zone key must not propagate while the
+        // downstream state has no subscribers: this is the per-minute rebuild
+        // work the gate exists to stop in the background.
+        source.value = AppTimeSnapshot(LocalDateTime.of(2026, 6, 11, 12, 1), utcZone)
+        runCurrent()
+        assertEquals(
+            "same-date minute ticks must be suppressed while unsubscribed",
+            1,
+            emissions.size,
+        )
+
+        job.cancel()
+    }
+
+    @Test
+    fun tickWhileSubscribed_passesKeyChangesWhileUnsubscribed() = runTest {
+        val utcZone = ZoneId.of("UTC")
+        val source = MutableStateFlow(
+            AppTimeSnapshot(LocalDateTime.of(2026, 6, 11, 23, 59), utcZone)
+        )
+        val subscriptions = MutableStateFlow(0)
+        val gated = source.tickWhileSubscribed(subscriptions) { it.minute.toLocalDate() to it.zone }
+        val emissions = mutableListOf<AppTimeSnapshot>()
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            gated.collect { emissions += it }
+        }
+        runCurrent()
+
+        // The midnight (and zone-change) re-anchor must still ride through in
+        // the background so the first frame after re-entry across a date
+        // boundary is anchored to the right day.
+        source.value = AppTimeSnapshot(LocalDateTime.of(2026, 6, 12, 0, 0), utcZone)
+        runCurrent()
+        assertEquals(
+            "date-key changes must pass through while unsubscribed",
+            LocalDateTime.of(2026, 6, 12, 0, 0),
+            emissions.last().minute,
+        )
+
+        job.cancel()
+    }
+
+    @Test
+    fun tickWhileSubscribed_deliversLiveTicksWhileSubscribed() = runTest {
+        val utcZone = ZoneId.of("UTC")
+        val source = MutableStateFlow(
+            AppTimeSnapshot(LocalDateTime.of(2026, 6, 11, 12, 0), utcZone)
+        )
+        val subscriptions = MutableStateFlow(1)
+        val gated = source.tickWhileSubscribed(subscriptions) { it.minute.toLocalDate() to it.zone }
+        val emissions = mutableListOf<AppTimeSnapshot>()
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            gated.collect { emissions += it }
+        }
+        runCurrent()
+
+        source.value = AppTimeSnapshot(LocalDateTime.of(2026, 6, 11, 12, 1), utcZone)
+        runCurrent()
+        assertEquals(
+            "minute ticks must flow live while subscribed",
+            LocalDateTime.of(2026, 6, 11, 12, 1),
+            emissions.last().minute,
+        )
+
+        // Subscribers leave, a tick is suppressed, subscribers return: the
+        // switch back to the live source must immediately deliver the current
+        // value so the UI re-anchors without waiting for the next tick.
+        subscriptions.value = 0
+        runCurrent()
+        source.value = AppTimeSnapshot(LocalDateTime.of(2026, 6, 11, 12, 2), utcZone)
+        runCurrent()
+        subscriptions.value = 1
+        runCurrent()
+        assertEquals(
+            "resubscribing must deliver the current value immediately",
+            LocalDateTime.of(2026, 6, 11, 12, 2),
+            emissions.last().minute,
+        )
+
+        job.cancel()
+    }
+
+    @Test
+    fun tickWhileSubscribed_valueReadsLiveSourceWithoutCollection() {
+        val utcZone = ZoneId.of("UTC")
+        val source = MutableStateFlow(
+            AppTimeSnapshot(LocalDateTime.of(2026, 6, 11, 12, 0), utcZone)
+        )
+        val gated = source.tickWhileSubscribed(MutableStateFlow(0)) { it.minute.toLocalDate() }
+
+        source.value = AppTimeSnapshot(LocalDateTime.of(2026, 6, 11, 12, 5), utcZone)
+
+        // Consumers (e.g. HomeRepository) anchor queries on nowFlow.value at
+        // subscription time; the gate must never serve a stale value there.
+        assertEquals(LocalDateTime.of(2026, 6, 11, 12, 5), gated.value.minute)
+    }
+}
+
+private class MutableInstantClock(
+    @Volatile var instant: Instant,
+    private val zone: ZoneId,
+) : Clock() {
+    var reads = 0
+        private set
+
+    override fun getZone(): ZoneId = zone
+
+    override fun withZone(zone: ZoneId): Clock =
+        MutableInstantClock(instant = instant, zone = zone)
+
+    override fun instant(): Instant {
+        reads++
+        return instant
+    }
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
+private class SchedulerClock(
+    private val scheduler: TestCoroutineScheduler,
+    private val baseInstant: Instant,
+    private val zone: ZoneId
+) : Clock() {
+    override fun getZone(): ZoneId = zone
+
+    override fun withZone(zone: ZoneId): Clock {
+        return SchedulerClock(
+            scheduler = scheduler,
+            baseInstant = baseInstant,
+            zone = zone
+        )
+    }
+
+    override fun instant(): Instant {
+        return baseInstant.plusMillis(scheduler.currentTime)
+    }
+}

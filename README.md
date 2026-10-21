@@ -4,19 +4,29 @@
 
 背屏显示雌二醇模型估算值与趋势、下一次计划用药倒计时、今日记录进度。浓度复用原 App 的小组件计算结果；日程使用原 App 的计划与记录匹配逻辑。不会自动记录用药或改变计划。
 
-[下载测试版 APK](https://github.com/misakayuuki/featherline-rear-card/releases/download/v0.1.0/Featherline-RearCard-0.1.0-arm64-debug.apk) · [完整源码包](https://github.com/misakayuuki/featherline-rear-card/releases/download/v0.1.0/Featherline-RearCard-0.1.0-source.zip) · [发布说明](https://github.com/misakayuuki/featherline-rear-card/releases/tag/v0.1.0) · [验证记录](VERIFICATION.md)
+[下载测试版 APK](https://github.com/misakayuuki/featherline-rear-card/releases/download/v0.2.0/Featherline-RearCard-0.2.0-arm64-debug.apk) · [完整源码包](https://github.com/misakayuuki/featherline-rear-card/releases/download/v0.2.0/Featherline-RearCard-0.2.0-source.zip) · [发布说明](https://github.com/misakayuuki/featherline-rear-card/releases/tag/v0.2.0) · [验证记录](VERIFICATION.md)
 
 ![示例布局，非真实个人数据](preview/structured-card.png)
 
 ## 安装与使用
 
 1. 在手机安装支持 API 2 的 [rear-card-bridge](https://github.com/finall1008/rear-card-bridge)，按该项目说明完成背屏所需授权。
-2. 安装 `dist/Featherline-RearCard-0.1.0-arm64-debug.apk`。桌面名称为 **Featherline 背屏测试版**，包名为 `com.mkx.hrttracker.debug`。
+2. 安装 `dist/Featherline-RearCard-0.2.0-arm64-debug.apk`。桌面名称为 **Featherline 背屏测试版**，包名为 `com.mkx.hrttracker.debug`。
 3. 在原 Featherline 导出加密备份，再用测试版的原有备份恢复功能导入。两个 App 的数据空间独立；之后需要在**背屏测试版**继续记录用药，原版中的新记录不会自动复制过来。请保留原版及备份，核对恢复结果后再使用。
 4. 在测试版中打开 **设置 → 外观 → Featherline 背屏**，选择 **开启同步并绑定**。如果提示数据未就绪，回到首页等加载完成再试。
 5. 在卡片桥选择并绑定背屏载体，按提示到系统背屏设置移除旧卡、重新应用该载体，再返回 Featherline。首次需要完成载体绑定，后续数据更新自动推送。
 
-无需手动安装单独的模块 ZIP；App 会发送包含当前数据的完整模块。`dist/featherline-rear-card-0.1.0.zip` 只是无个人数据的初始模块，单独安装不会获得浓度或日程。
+无需手动安装单独的模块 ZIP；App 会发送包含当前数据的完整模块。`dist/featherline-rear-card-0.2.0.zip` 只是无个人数据的初始模块，单独安装不会获得浓度或日程。
+
+## 卡片外观设置
+
+在**卡片桥 → 本模块 → 设置页面**中调整外观。支持樱粉、雾紫、薄荷、晴蓝和暖杏五种主题，自定义强调色与背景色、显示趋势、隐私模式、镜头避让和恢复默认。颜色过于接近时会调整文字颜色以保持可读性。设置页的预览使用示例数据。
+
+设置保存在卡片桥内，日常数据同步和同一模块覆盖更新会保留配置。更改后会请求背屏刷新；背屏休眠或系统仍显示静止画面时，需要唤醒后查看。隐私模式隐藏卡片上的浓度、计划和进度，但不会从卡片桥删除已同步的数据。
+
+从 0.1.0 升级时，直接覆盖安装新版 APK，打开 Featherline 的背屏设置点击 **立即同步**，再进入卡片桥的模块设置页。无需卸载旧测试版。请同时更新 App，旧版 App 仍携带旧模块，不会自动获得新设置页面。
+
+没有数据时，卡片会显示背屏适配版的 GitHub 地址，并说明安装及开启同步的方法。设置页也提供可点击的下载链接。卡片桥不提供 App 安装检测能力，因此提示依据是“尚未收到数据”，不会把未同步直接当成未安装。
 
 ## 更新与显示规则
 
